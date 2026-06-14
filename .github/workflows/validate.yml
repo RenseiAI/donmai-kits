@@ -4,12 +4,13 @@ name: validate
 # every push and pull request. Pure-stdlib Python validator — no dependency
 # install step, so the job stays fast and hermetic.
 #
-# TODO(3.6 — signing CI): a follow-up job will keyless-sign each kit.toml with
-# Sigstore (cosign / sigstore-python) on tagged releases and emit the sibling
-# `<kit>.kit.toml.sigstore` bundle, plus verify the catalog against the vendor
-# trust root. See CONTRIBUTING.md § "Signing model" and docs/adr/ADR-0001 for
-# the intended `signed-by-allowlist` flow. Do NOT add fake/placeholder
-# signatures here.
+# Keyless Sigstore signing (master plan step 3.6) lives in the sibling
+# `sign.yml` workflow: on push to main / release it keyless-signs each
+# kit.toml with cosign (GitHub Actions OIDC → Fulcio → Rekor) and emits the
+# sibling `<kit>.kit.toml.sigstore` bundle the daemon verifier consumes. This
+# workflow stays scoped to schema validation + OSS-clean hygiene so it remains
+# fast and side-effect-free on every PR. See CONTRIBUTING.md § "Signing model"
+# and docs/adr/ADR-0001 for the end-to-end `signed-by-allowlist` flow.
 
 on:
   push:

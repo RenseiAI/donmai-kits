@@ -1,0 +1,168 @@
+name: sign
+
+# Keyless Sigstore signing of the official kit catalog (master plan step 3.6).
+#
+# On push to main (and on tagged releases / manual dispatch) this workflow
+# uses GitHub Actions OIDC + cosign to keyless-sign every `kits/*/kit.toml`,
+# producing a sibling `<kit>.kit.toml.sigstore` bundle next to each manifest.
+# No long-lived keys exist: cosign exchanges the job's OIDC token for a
+# short-lived Fulcio certificate, signs the manifest digest, records the
+# entry in the Rekor transparency log, and packages everything into a
+# self-contained Sigstore bundle.
+#
+# The execution-layer daemon's bundle-mode verifier reads the sibling
+# `.sigstore` file, hashes the manifest, and verifies the bundle against the
+# embedded (public-good Fulcio/Rekor) trust root plus its default issuer
+# allowlist. The allowlisted signer identity is THIS workflow's OIDC subject:
+#
+#   SAN    = https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main
+#   issuer = https://token.actions.githubusercontent.com
+#
+# That pair is baked into the daemon's default `trust.issuerSet`, so official
+# kits install under the default `signed-by-allowlist` trust mode WITHOUT the
+# `--allow-unsigned` override. See CONTRIBUTING.md § "Signing model" and
+# docs/adr/ADR-0001 for the end-to-end flow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kits/**/kit.toml"
+      - ".github/workflows/sign.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# OIDC keyless signing requires `id-token: write`; committing the bundles
+# back to main on push requires `contents: write`.
+permissions:
+  contents: write
+  id-token: write
+
+# Never run two signing passes concurrently against the same ref — the
+# second push-back would race the first.
+concurrency:
+  group: sign-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate before signing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Never sign a catalog that doesn't pass schema validation.
+      - name: Validate every kit.toml against the schema
+        run: python3 scripts/validate_kits.py
+
+  sign:
+    name: keyless-sign the kit catalog
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use the default GITHUB_TOKEN so the bundle push-back is
+          # authenticated; fetch full history is unnecessary.
+          persist-credentials: true
+
+      # Install cosign. The Sigstore-maintained installer pins a known-good
+      # cosign release; no long-lived keys are introduced.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Keyless-sign each kit.toml into a sibling .sigstore bundle
+        env:
+          # cosign reads the OIDC token from the Actions runtime; setting
+          # COSIGN_EXPERIMENTAL is no longer required on cosign v2+, but we
+          # force non-interactive keyless mode explicitly.
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          signed=0
+          for manifest in kits/*/kit.toml; do
+            bundle="${manifest}.sigstore"
+            echo "::group::sign ${manifest}"
+            # Keyless sign-blob over the raw manifest bytes. cosign hashes
+            # the artifact (sha256), exchanges the Actions OIDC token for a
+            # short-lived Fulcio cert, logs to Rekor, and writes a
+            # self-contained Sigstore bundle the daemon verifier consumes.
+            cosign sign-blob \
+              --yes \
+              --bundle "${bundle}" \
+              "${manifest}"
+            echo "wrote ${bundle}"
+            signed=$((signed + 1))
+            echo "::endgroup::"
+          done
+          if [ "${signed}" -eq 0 ]; then
+            echo "::error::no kits/*/kit.toml manifests found to sign"
+            exit 1
+          fi
+          echo "signed ${signed} kit manifest(s)"
+
+      # Sanity-check: every signed bundle must verify against the same
+      # keyless identity the daemon allowlists, BEFORE we publish it. This
+      # catches a drift between the workflow's actual OIDC subject and the
+      # identity the daemon trusts.
+      - name: Verify each bundle against the official signer identity
+        env:
+          EXPECTED_SAN: "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
+          EXPECTED_ISSUER: "https://token.actions.githubusercontent.com"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # On a release/tag the SAN ref differs (refs/tags/...), so only
+          # enforce the exact main-ref SAN on a push to main. Other event
+          # types still verify the issuer + repo-scoped SAN regex.
+          for manifest in kits/*/kit.toml; do
+            bundle="${manifest}.sigstore"
+            echo "::group::verify ${manifest}"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              cosign verify-blob \
+                --bundle "${bundle}" \
+                --certificate-identity "${EXPECTED_SAN}" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${manifest}"
+            else
+              cosign verify-blob \
+                --bundle "${bundle}" \
+                --certificate-identity-regexp "^https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${manifest}"
+            fi
+            echo "::endgroup::"
+          done
+
+      # Commit the bundles back to main on push. On release/tag events the
+      # bundles are produced for the workflow's verify step and uploaded as
+      # an artifact rather than committed (the tag ref is immutable).
+      - name: Commit signed bundles back to main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add kits/*/kit.toml.sigstore
+          if git diff --cached --quiet; then
+            echo "no bundle changes to commit"
+            exit 0
+          fi
+          git commit -m "chore(sign): refresh kit Sigstore bundles [skip ci]"
+          git push
+
+      - name: Upload bundles as a build artifact
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kit-sigstore-bundles
+          path: kits/*/kit.toml.sigstore
+          if-no-files-found: error
