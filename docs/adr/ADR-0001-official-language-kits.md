@@ -1,6 +1,6 @@
 # ADR-0001 — Official language kits and the catalog home
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-13
 - **Boundary:** OSS-only
 - **Scope:** The official language-kit catalog (TypeScript, Go, Rust, Java,
