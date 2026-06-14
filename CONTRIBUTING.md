@@ -1,0 +1,132 @@
+# Contributing to donmai-kits
+
+This catalog ships the official language kits for the donmai execution layer.
+Kits are declarative TOML manifests plus a few supporting files; authoring one
+is mechanical, but a few cross-cutting gotchas bite if you skip them.
+
+## Authoring a kit
+
+1. Create `kits/<lang>/kit.toml` with `api = "rensei.dev/v1"` and the `[kit]`
+   identity block. Copy an existing kit (e.g. `kits/go/kit.toml`) as a template.
+2. Declare detection in `[detect]` — exact filenames in `files` (any-exists) and
+   `files_all` (all-exist). Pre-declare the toolchain pin in `[detect.toolchain]`
+   (e.g. `go = "1.23"`) so the workarea can pre-warm it.
+3. Declare `[provide.commands]` (`build` / `test` / `validate`) and per-OS
+   `[provide.toolchain_install.<os>]` install scripts.
+4. Add a `post_acquire` hook (`bin/setup.sh` + `bin/setup.cmd`) that fetches
+   **framework dependencies only** — never the base toolchain (that is the
+   install-scripts' job; the two streams run in order: install → post_acquire).
+5. Add at least one `SKILL.md` under `skills/<id>/` and a conventions partial
+   under `partials/` so the skill-load and prompt-fragment paths are exercised.
+6. Set `[composition].order` — `foundation` for a base language, `framework` for
+   a framework that composes on top of a foundation kit.
+7. Run the validator: `python3 scripts/validate_kits.py`.
+
+### Required contribution surface
+
+Every catalog kit should declare: `[provide.commands]`, per-OS
+`[provide.toolchain_install]` (at minimum `.linux` — cloud sandboxes are Linux),
+a `post_acquire` hook, `[provide.tool_permissions]` for the language's shell
+verbs, ≥1 `[provide.skills]`, ≥1 `[provide.prompt_fragments]`, and
+`[provide.workarea_config]` (`clean_dirs` + cache `preserve_dirs`).
+
+## Authoring gotchas (carry these into every kit)
+
+- **`.linux` is load-bearing.** Cloud sandboxes are Linux. `.macos` / `.windows`
+  install scripts are local/dev parity; the `.linux` script is what runs in the
+  hosted path. Get it right first.
+- **Arch pinning.** The Go-style tarball install hardcodes `amd64`. arm64 cloud
+  images need a `$(uname -m)` branch or an OS+arch-keyed install variant.
+  Package-manager installers (`apt`, `brew`, `winget`) pick the right arch
+  automatically; raw tarball downloads do not.
+- **PATH-mutating installers (Rust, Python `uv`, Ruby `rbenv`).** These write to
+  `~/.cargo`, `~/.local/bin`, `~/.rbenv` and put their tools on PATH via an env
+  file or shim init. Until `demand.env` is wired end-to-end (see below), the
+  install scripts AND the `post_acquire` hook must source that env file
+  themselves so the next command sees the tool.
+- **Build-tool wrappers.** Java commands assume a committed `./mvnw`; Ruby/Python
+  assume `Gemfile` / `pyproject` lockfiles. Document the assumption; a repo
+  without the wrapper still gets the toolchain installed but may need a local
+  `.kit.toml` to override the commands.
+- **No globs in detection.** The daemon's declarative matcher checks exact
+  filenames via `os.Stat` — `*.gemspec` / `*.csproj` will NOT match. Detect on a
+  concrete file (`Gemfile`, `go.mod`, `tsconfig.json`). Glob/exec detection is a
+  future phase.
+- **One foundation per repo.** Two `order = "foundation"` kits matching the same
+  repo is a hard error (`ErrKitFoundationConflict`). Foundation kits must detect
+  on disjoint files; frameworks (`order = "framework"`) compose on top.
+- **Cold-provision flake.** Every cold provision re-installs the toolchain
+  (apt/curl). This is slow and flaky for real-mode cloud smokes. Pre-baked
+  per-language sandbox images are the first optimization (future work).
+
+## OSS-clean rules (this repo is public)
+
+Before committing, strip private references — Linear ticket IDs, closed-source
+repo names, internal SHAs, and the product brand domain:
+
+```bash
+grep -rnE 'REN-[0-9]|REN2-[0-9]|SUP-[0-9]|rensei-architecture|rensei-ops|RenseiAI/rensei|rensei-tui|rensei-platform|rensei\.ai' \
+  --include='*.toml' --include='*.md' --include='*.yaml' --include='*.yml' \
+  --include='*.sh' --include='*.cmd' --include='*.json' --exclude-dir='.git' .
+```
+
+The CI `oss-clean` job runs the same grep and fails the build on a hit. Keep kit
+identity brand-neutral: use `author = "donmai"`, `did:web:donmai.dev`,
+`homepage = "https://donmai.dev"`, and `repository = ".../donmai-kits"`.
+
+> Note: `api = "rensei.dev/v1"` is the manifest **protocol version constant** the
+> daemon parser keys on — it is a wire identifier, not a product name, and is
+> intentionally preserved verbatim across every manifest. Do not rename it.
+
+## Signing model
+
+Kit installs are signature-gated by the execution-layer daemon's trust system.
+
+- **Format:** Sigstore bundle mode. The verifier reads a sibling
+  `<manifest>.sigstore` file, hashes the manifest, and verifies the bundle
+  against a trust root + an issuer allowlist (keyless / OIDC, Fulcio SAN
+  identity).
+- **Trust modes (daemon-wide):**
+  - `permissive` — verify + report, never block (emits a warning).
+  - `signed-by-allowlist` — **the default.** Rejects unsigned and
+    signed-but-unverified kits; only an allowlisted signer's verified kit
+    installs.
+  - `attested` — allowlist today; SLSA attestation graph is future work.
+- **The cliff:** under the default `signed-by-allowlist` with an empty issuer
+  allowlist, the gate **fails closed** — no kit installs. The audit-logged
+  `donmai kit install --allow-unsigned` override (or flipping to `permissive`)
+  is the only path until a vendor trust root + signer exist.
+
+### The intended `signed-by-allowlist` flow (follow-up — NOT YET IMPLEMENTED)
+
+The signing CI is **step 3.6**, a clearly-scoped follow-up. The plan:
+
+1. A release CI job keyless-signs each `kit.toml` with Sigstore (cosign /
+   sigstore-python), producing a sibling `<id>.kit.toml.sigstore` bundle, on
+   tagged releases.
+2. The CI runs under a stable, published OIDC identity (a Fulcio SAN, e.g. a
+   workflow identity) that becomes *the* official-kit signer.
+3. That signer identity is added to the default `trust.issuerSet` shipped with
+   the execution-layer binary, and the embedded public-good trust root is
+   replaced with the vendor trust root.
+4. Result: official kits install cleanly under `signed-by-allowlist` with **no**
+   `--allow-unsigned` override.
+
+**Do NOT fabricate signatures.** No placeholder `.sigstore` files belong in this
+repo until the real signing CI emits them. See
+[`docs/adr/ADR-0001-official-language-kits.md`](./docs/adr/ADR-0001-official-language-kits.md).
+
+## The `demand.env` follow-up (cross-repo, NOT YET WIRED)
+
+PATH-mutating installers (Rust/Python/Ruby) need their tool directory threaded
+onto PATH for every kit command. The composed toolchain demand carries an
+optional `env` map for exactly this, but the composer does not yet populate it —
+it is "currently always nil from Compose." Wiring it end-to-end (composer →
+execer in both the Go runner and the platform provisioner) is a separate
+cross-repo task.
+
+**Until then,** each PATH-mutating kit's install scripts and `post_acquire` hook
+source the relevant env file themselves (`. $HOME/.cargo/env`, prepend
+`$HOME/.local/bin`, `eval "$(rbenv init -)"`). When `demand.env` lands, each kit
+should declare its PATH augmentation once and drop the per-script sourcing.
+Every such kit's `kit.toml` carries a header comment marking the TODO.

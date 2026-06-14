@@ -1,0 +1,69 @@
+name: validate
+
+# Validates every kit.toml in the catalog against the kit manifest schema on
+# every push and pull request. Pure-stdlib Python validator — no dependency
+# install step, so the job stays fast and hermetic.
+#
+# TODO(3.6 — signing CI): a follow-up job will keyless-sign each kit.toml with
+# Sigstore (cosign / sigstore-python) on tagged releases and emit the sibling
+# `<kit>.kit.toml.sigstore` bundle, plus verify the catalog against the vendor
+# trust root. See CONTRIBUTING.md § "Signing model" and docs/adr/ADR-0001 for
+# the intended `signed-by-allowlist` flow. Do NOT add fake/placeholder
+# signatures here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-schema:
+    name: validate kit manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate every kit.toml against the schema
+        run: python3 scripts/validate_kits.py
+
+  oss-clean:
+    name: OSS-clean (no private references)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repo is OSS-public. Block private Linear IDs, the closed-source
+      # architecture/platform repo names, and the product brand domain from
+      # ever landing in a kit, doc, or workflow file. Mirrors the org-wide
+      # publishing-hygiene grep.
+      - name: Grep for private references
+        run: |
+          set -euo pipefail
+          # The blocklist pattern itself lives in this workflow and in
+          # CONTRIBUTING.md (which documents the grep), so exclude those two
+          # self-referential files to avoid a guaranteed false positive.
+          PATTERN='REN-[0-9]|REN2-[0-9]|SUP-[0-9]|rensei-architecture|rensei-ops|RenseiAI/rensei|rensei-tui|rensei-platform|rensei\.ai'
+          if grep -rnE "$PATTERN" \
+              --include='*.toml' \
+              --include='*.md' \
+              --include='*.yaml' \
+              --include='*.yml' \
+              --include='*.sh' \
+              --include='*.cmd' \
+              --include='*.json' \
+              --exclude-dir='.git' \
+              --exclude='validate.yml' \
+              --exclude='CONTRIBUTING.md' \
+              .; then
+            echo "::error::Private references found — strip them before merging (see CONTRIBUTING.md)."
+            exit 1
+          fi
+          echo "OSS-clean: no private references found."
