@@ -95,8 +95,16 @@ jobs:
             # the artifact (sha256), exchanges the Actions OIDC token for a
             # short-lived Fulcio cert, logs to Rekor, and writes a
             # self-contained Sigstore bundle the daemon verifier consumes.
+            #
+            # --new-bundle-format is REQUIRED: the execution-layer daemon
+            # parses the protobuf Sigstore bundle (mediaType
+            # application/vnd.dev.sigstore.bundle...+json) via sigstore-go's
+            # bundle.LoadJSONFromPath. cosign's legacy --bundle blob format
+            # ({base64Signature,cert,rekorBundle}) is NOT parseable by that
+            # verifier and would read as signed-but-unverified.
             cosign sign-blob \
               --yes \
+              --new-bundle-format=true \
               --bundle "${bundle}" \
               "${manifest}"
             echo "wrote ${bundle}"
@@ -128,12 +136,14 @@ jobs:
             echo "::group::verify ${manifest}"
             if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
               cosign verify-blob \
+                --new-bundle-format=true \
                 --bundle "${bundle}" \
                 --certificate-identity "${EXPECTED_SAN}" \
                 --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
                 "${manifest}"
             else
               cosign verify-blob \
+                --new-bundle-format=true \
                 --bundle "${bundle}" \
                 --certificate-identity-regexp "^https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@" \
                 --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
