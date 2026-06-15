@@ -1,11 +1,11 @@
 # ADR-0001 — Official language kits and the catalog home
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-13
 - **Boundary:** OSS-only
-- **Scope:** The official language-kit catalog (TypeScript, Go, Rust, Java,
-  Python, Ruby), where it lives, and the signing / `demand.env` follow-ups it
-  depends on.
+- **Scope:** The official language-kit catalog (TypeScript, TS/Next.js, Go, Rust,
+  Java, Python, Ruby), where it lives, its keyless Sigstore signing, and the
+  `demand.env` follow-up it depends on.
 
 ## Context
 
@@ -18,11 +18,15 @@ manifest string embedded in the closed platform.
 
 Two cross-cutting facts shape this decision:
 
-1. **The default trust mode is now `signed-by-allowlist`.** A security change
-   flipped the compiled-in default from `permissive`. Under the new default with
-   an empty issuer allowlist, the gate **fails closed** — no kit installs until
-   an operator populates the allowlist or opts back to `permissive`. No vendor
-   trust root or signing CI exists yet, so every official kit is unsigned today.
+1. **The default trust mode is `signed-by-allowlist`, and the vendor trust root
+   ships compiled-in.** A security change flipped the compiled-in default from
+   `permissive`. The daemon does NOT ship an empty allowlist: at startup it seeds
+   `trust.issuerSet` with the official kit-signing identity (the
+   `defaultVendorIssuerSet()` default). The signing CI and the embedded
+   public-good Sigstore trust root have both landed, so every official kit ships a
+   real sibling `.sigstore` bundle and installs under `signed-by-allowlist`
+   without `--allow-unsigned`. The gate fails closed only for unsigned or
+   untrusted-signer kits (typically third-party or locally-built ones).
 2. **Kits are execution-layer content.** A kit is a declarative detection +
    toolchain + commands + skills contract with no server side and no platform
    dependency. Per the OSS line ("client/execution + contracts are OSS;
@@ -36,7 +40,7 @@ Two cross-cutting facts shape this decision:
    files consumed by the Go execution layer via the daemon scan path / git
    install — not TS library code — so a dedicated content repo is the clean home.
 
-2. **Author six foundation/framework kits** — manifests-only, zero machinery
+2. **Author seven foundation/framework kits** — manifests-only, zero machinery
    changes (the parser, detection, composition, and provisioner already execute
    any conforming manifest):
 
@@ -59,13 +63,18 @@ Two cross-cutting facts shape this decision:
    pair. The platform should consume this OSS catalog rather than embedding its
    own TS kit string (resolving the prior drift).
 
-4. **Stand up signing CI + a vendor trust root (follow-up, step 3.6).** Keyless
-   Sigstore signing of each `kit.toml` → sibling `.sigstore` bundle on tagged
-   releases, under a published OIDC signer identity; add that signer to the
-   default `trust.issuerSet` shipped with the binary; replace the embedded
-   public-good trust root with the vendor root. This makes official kits install
-   under `signed-by-allowlist` without `--allow-unsigned` — the gating
-   dependency the trust-default change created. **Not implemented in this scaffold.**
+4. **Signing CI + vendor trust root — LANDED.** Keyless Sigstore signing runs in
+   `.github/workflows/sign.yml` on push to `main` (and on tags / manual dispatch):
+   GitHub Actions OIDC → Fulcio short-lived cert, logged in the public-good Rekor
+   transparency log, emitting a protobuf-format sibling `kit.toml.sigstore` bundle
+   per kit (`cosign sign-blob --new-bundle-format`). The daemon's compiled-in
+   `defaultVendorIssuerSet()` pins that workflow's exact Fulcio SAN
+   (`…/sign.yml@refs/heads/main`) + OIDC issuer, and the embedded public-good
+   Sigstore trust root verifies the chain offline. The result: official kits
+   install under the default `signed-by-allowlist` mode without `--allow-unsigned`.
+   (The "vendor trust root" here is the embedded public-good root narrowed by the
+   pinned vendor signer identity — a self-hosted Fulcio is not used, because a
+   GitHub-OIDC-issued cert can only validate against the public-good root.)
 
 5. **Wire `demand.env` end-to-end (follow-up, cross-repo).** Populate the
    composed demand's `env` map (currently always nil from the composer) so
@@ -77,17 +86,17 @@ Two cross-cutting facts shape this decision:
 
 - OSS users get language coverage out of the box; the platform consumes the
   catalog rather than authoring kits.
-- A single CI can sign the whole catalog in one pass, and a single parity
+- The signing CI signs the whole catalog in one pass, and a single parity
   fixture can guard composer drift across the layer.
-- The trust gate becomes usable for official kits once the signer + trust root
-  land — realizing the security change's intent rather than working around it.
-- These kits are **unsigned until 3.6 lands**; installing them requires
-  `--allow-unsigned` (audit-logged) or a `permissive` trust mode.
+- The trust gate is usable for official kits today — the compiled-in vendor
+  trust root realizes the security change's intent rather than working around it.
+- These kits are **signed** — each ships a `kit.toml.sigstore` bundle — and
+  install under the default `signed-by-allowlist` mode with no `--allow-unsigned`
+  and no `permissive` opt-out. Those overrides remain only for unsigned
+  third-party kits.
 
 ## Open questions
 
-- **O1 — Signing CI ownership + trust-root publication timeline.** Until it
-  exists, official kits ship unsigned. Owner-gated.
 - **O2 — Pre-baked sandbox images** per language to de-flake cold cloud
   provisioning before real-mode smokes.
 - **O3 — `demand.env` schema.** Whether kits declare PATH augmentation via a new
