@@ -95,25 +95,45 @@ Kit installs are signature-gated by the execution-layer daemon's trust system.
 - **The cliff:** under the default `signed-by-allowlist` with an empty issuer
   allowlist, the gate **fails closed** — no kit installs. The audit-logged
   `donmai kit install --allow-unsigned` override (or flipping to `permissive`)
-  is the only path until a vendor trust root + signer exist.
+  is the only bypass. Official catalog kits do not hit the cliff: the CI
+  signer identity below ships in the daemon's default `trust.issuerSet`.
 
-### The intended `signed-by-allowlist` flow (follow-up — NOT YET IMPLEMENTED)
+### The live `signed-by-allowlist` flow (CI-emitted bundles)
 
-The signing CI is **step 3.6**, a clearly-scoped follow-up. The plan:
+The signing CI (master plan step 3.6) is live in
+[`.github/workflows/sign.yml`](./.github/workflows/sign.yml):
 
-1. A release CI job keyless-signs each `kit.toml` with Sigstore (cosign /
-   sigstore-python), producing a sibling `<id>.kit.toml.sigstore` bundle, on
-   tagged releases.
-2. The CI runs under a stable, published OIDC identity (a Fulcio SAN, e.g. a
-   workflow identity) that becomes *the* official-kit signer.
-3. That signer identity is added to the default `trust.issuerSet` shipped with
-   the execution-layer binary, and the embedded public-good trust root is
-   replaced with the vendor trust root.
-4. Result: official kits install cleanly under `signed-by-allowlist` with **no**
-   `--allow-unsigned` override.
+1. On push to `main` touching `kits/**/kit.toml` (also on published releases
+   and manual dispatch), the workflow first re-runs `scripts/validate_kits.py`
+   — nothing unvalidated is ever signed.
+2. It then keyless-signs every `kits/*/kit.toml` with
+   `cosign sign-blob --new-bundle-format=true`: the job's GitHub Actions OIDC
+   token is exchanged for a short-lived Fulcio certificate, the signature is
+   logged to Rekor, and a self-contained protobuf Sigstore bundle is written
+   as the sibling `<kit>.kit.toml.sigstore`. (`--new-bundle-format` is
+   required — the daemon verifier parses the protobuf bundle via sigstore-go;
+   cosign's legacy blob-bundle format reads as signed-but-unverified.)
+3. Before publishing, every bundle is verified with `cosign verify-blob`
+   against the exact identity the daemon allowlists:
 
-**Do NOT fabricate signatures.** No placeholder `.sigstore` files belong in this
-repo until the real signing CI emits them. See
+   ```
+   SAN    = https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main
+   issuer = https://token.actions.githubusercontent.com
+   ```
+
+   This catches drift between the workflow's actual OIDC subject and the
+   identity the daemon trusts.
+4. On push to `main`, the refreshed bundles are committed back to `main`
+   (`chore(sign): refresh kit Sigstore bundles [skip ci]`); on release/dispatch
+   they are uploaded as a build artifact instead (tag refs are immutable).
+5. Result: that SAN/issuer pair is baked into the daemon's default
+   `trust.issuerSet`, so official kits install cleanly under
+   `signed-by-allowlist` with **no** `--allow-unsigned` override.
+
+**Never hand-place or fabricate a `.sigstore` file.** CI emits them — after a
+manifest edit merges to `main`, `sign.yml` refreshes the sibling bundle
+automatically. A placeholder or hand-crafted bundle would either fail
+verification or mask a broken signing pipeline. See
 [`docs/adr/ADR-0001-official-language-kits.md`](./docs/adr/ADR-0001-official-language-kits.md).
 
 ## The `demand.env` follow-up (cross-repo, NOT YET WIRED)

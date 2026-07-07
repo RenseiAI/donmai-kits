@@ -103,11 +103,38 @@ Kit installs are signature-gated. The execution layer verifies a sibling
 `<manifest>.sigstore` bundle against a trust root and an issuer allowlist, and
 the default trust mode (`signed-by-allowlist`) refuses unsigned kits.
 
-**Signing CI is a follow-up (see [`CONTRIBUTING.md`](./CONTRIBUTING.md) §
-"Signing model" and [`docs/adr/ADR-0001-official-language-kits.md`](./docs/adr/ADR-0001-official-language-kits.md)).**
-Until the vendor trust root + keyless-signing CI land, these kits are unsigned;
-install them with the audit-logged `--allow-unsigned` override or a `permissive`
-trust mode. No fake signatures are shipped here.
+**Signing is live.** On every merge to `main` that touches a manifest,
+[`.github/workflows/sign.yml`](./.github/workflows/sign.yml) keyless-signs
+every `kits/*/kit.toml` with cosign (GitHub Actions OIDC → Fulcio → Rekor,
+`--new-bundle-format=true`) and commits the sibling `kit.toml.sigstore`
+bundle back to `main`. No long-lived keys exist. The allowlisted signer
+identity is that workflow's own OIDC subject:
+
+```
+SAN    = https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main
+issuer = https://token.actions.githubusercontent.com
+```
+
+That pair is baked into the daemon's default `trust.issuerSet`, so the
+official kits in this catalog install cleanly under the default
+`signed-by-allowlist` mode with no override.
+
+Trust modes (daemon-wide):
+
+- `permissive` — verify + warn, never block.
+- `signed-by-allowlist` — **the default.** Rejects unsigned and
+  signed-but-unverified kits; only an allowlisted signer's verified kit installs.
+- `attested` — allowlist today; SLSA attestation is future work.
+
+The cliff: under the default `signed-by-allowlist` mode with an **empty**
+issuer allowlist, the gate fails **closed** — no kit installs. The audit-logged
+`donmai kit install --allow-unsigned` override (or flipping to `permissive`)
+is the only bypass.
+
+`.sigstore` bundles are never hand-placed or fabricated — CI emits them. To
+refresh a bundle, merge the manifest change to `main` and let `sign.yml` sign
+it. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) § "Signing model" and
+[`docs/adr/ADR-0001-official-language-kits.md`](./docs/adr/ADR-0001-official-language-kits.md).
 
 ## Contributing
 
