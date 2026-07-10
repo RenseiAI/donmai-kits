@@ -594,6 +594,7 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
     git_modes = _git_mode_map(root)
     collision_owners: dict[str, str] = {}
     entries: list[dict[str, Any]] = []
+    file_snapshots: dict[str, tuple[tuple[int, ...], str, int]] = {}
 
     kit_parts = _relative_parts(root, kit_dir)
     _require(
@@ -663,6 +664,11 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
                     ),
                 }
             )
+            file_snapshots[rel_path] = (
+                _stable_file_metadata(stable_info),
+                hashlib.sha256(data).hexdigest(),
+                len(data),
+            )
         _require(
             directory_names(directory_fd, label) == initial_names,
             f"payload directory {label} changed during enumeration",
@@ -670,6 +676,16 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
 
     with _open_relative_directory(root, kit_parts) as kit_fd:
         visit(kit_fd)
+        for rel_path, (metadata, digest, size) in sorted(file_snapshots.items()):
+            current, current_info = _read_regular_file(
+                root, kit_dir.joinpath(*rel_path.split("/"))
+            )
+            _require(
+                _stable_file_metadata(current_info) == metadata
+                and len(current) == size
+                and hashlib.sha256(current).hexdigest() == digest,
+                f"payload path {rel_path!r} changed after initial inventory",
+            )
     entries.sort(key=lambda entry: entry["path"].encode("utf-8"))
     return entries
 
@@ -1195,10 +1211,12 @@ def check_version_bumps(root: Path, base_ref: str, paths: Iterable[str]) -> None
     for kit_name in sorted(changed_kits):
         manifest_rel = f"kits/{kit_name}/{MANIFEST_NAME}"
         before = _git_file(root, base_ref, manifest_rel)
-        current_path = root / manifest_rel
-        if not current_path.exists():
+        current_raw = _git_file(root, "HEAD", manifest_rel)
+        if current_raw is None:
+            # A directory move presents as a deletion plus an addition. The
+            # deleted side has no candidate version to inspect; the added side
+            # is still checked against the full historical identity index.
             continue
-        current_raw = current_path.read_bytes()
         kit_id, new_version = _manifest_id_version(current_raw, manifest_rel)
         if before is not None:
             old_version = _manifest_version(before, f"{base_ref}:{manifest_rel}")

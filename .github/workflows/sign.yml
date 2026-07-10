@@ -8,7 +8,9 @@ name: sign
 #      kit.version bump for any payload change);
 #   3. generate canonical kit.package.json after the legacy bundle is stable;
 #   4. sign + verify kit.package.json; and
-#   5. atomically commit every descriptor/bundle plus the activation marker.
+#   5. stage every descriptor/bundle plus the activation marker;
+#   6. verify an immutable archive of that exact Git tree; and
+#   7. commit only when the resulting commit has that verified tree.
 #
 # The descriptor inventories kit.toml.sigstore, so refreshing an unchanged
 # legacy bundle would change package identity at the same kit id/version. The
@@ -211,7 +213,7 @@ jobs:
           python3 scripts/validate_kits.py
           python3 scripts/package_kits.py check
 
-      - name: Commit signed package set back to main
+      - name: Verify immutable package tree and commit it back to main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
@@ -219,10 +221,6 @@ jobs:
             echo "::error::package publication commits are restricted to a main push"
             exit 1
           fi
-          # All bundles were verified above against the exact main SAN+issuer.
-          # Now bind that authenticated run to the only allowed dirty shape.
-          python3 scripts/package_kits.py publication-check
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add \
@@ -230,11 +228,56 @@ jobs:
             kits/*/kit.toml.sigstore \
             kits/*/kit.package.json \
             kits/*/kit.package.json.sigstore
+
+          # Bind the signer output to the only allowed dirty shape before
+          # deriving the candidate Git tree. Authored payload remains the
+          # already-reviewed HEAD tree; only generated publication files are
+          # staged here.
+          python3 scripts/package_kits.py publication-check
           if git diff --cached --quiet; then
             echo "no package publication changes to commit"
             exit 0
           fi
+
+          candidate_tree="$(git write-tree)"
+          snapshot="$(mktemp -d)"
+          trap 'rm -rf "${snapshot}"' EXIT
+          git archive --format=tar "${candidate_tree}" | tar -xf - -C "${snapshot}"
+
+          # This archive, not the mutable Actions worktree, is the publication
+          # authority. Recompute every inventory and re-verify both signature
+          # classes against the exact bytes and modes in the candidate tree.
+          python3 "${snapshot}/scripts/validate_kits.py"
+          python3 "${snapshot}/scripts/package_kits.py" check
+
+          kits=(go java python ruby rust ts-nextjs typescript)
+          for kit in "${kits[@]}"; do
+            manifest="${snapshot}/kits/${kit}/kit.toml"
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${manifest}.sigstore" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${manifest}"
+
+            descriptor="${snapshot}/kits/${kit}/kit.package.json"
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${descriptor}.sigstore" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${descriptor}"
+          done
+
+          if [[ "$(git write-tree)" != "${candidate_tree}" ]]; then
+            echo "::error::staged publication changed during immutable-tree verification"
+            exit 1
+          fi
           git commit -m "chore(sign): publish signed kit packages [skip ci]"
+          if [[ "$(git rev-parse 'HEAD^{tree}')" != "${candidate_tree}" ]]; then
+            echo "::error::publication commit does not contain the verified candidate tree"
+            exit 1
+          fi
           git push
 
       - name: Upload signed packages as a build artifact

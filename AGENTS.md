@@ -104,8 +104,10 @@ your last edit and quote each result line in your report.
   and portable `0644`/`0755` modes. Its own detached
   `kit.package.json.sigstore` is excluded, preventing self-reference.
 - The seven descriptors, their package bundles, any changed legacy bundles,
-  and `.kit-package-v1-active` are committed together only after strict local
-  validation and `cosign verify-blob` against the official identity.
+  and `.kit-package-v1-active` are staged together. The workflow archives that
+  exact Git tree, runs strict validation and `cosign verify-blob` against the
+  official identity from the immutable archive, and commits only that verified
+  tree.
 - The allowlisted signer identity is that workflow's own OIDC SAN pinned to
   `sign.yml@refs/heads/main`; the daemon's default `trust.issuerSet` trusts
   exactly that identity/issuer pair.

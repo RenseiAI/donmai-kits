@@ -151,9 +151,11 @@ issuer = https://token.actions.githubusercontent.com
 The package descriptor inventories every payload file — including the stable
 legacy manifest bundle — by normalized path, SHA-256, byte size, and portable
 mode. The descriptor excludes itself and its detached signature to avoid a
-cycle. The workflow signs in that exact order, verifies both bundle classes,
-then atomically commits all seven package publications plus the activation
-marker.
+cycle. The workflow signs in that exact order, stages all seven package
+publications plus the activation marker, and materializes that exact Git tree
+as an immutable archive. It recomputes every inventory and verifies both bundle
+classes from the archive, then commits only if the commit tree is byte-for-byte
+the verified tree.
 
 That identity pair is baked into the daemon's default `trust.issuerSet` for
 the legacy manifest gate. The current daemon installer has not yet implemented

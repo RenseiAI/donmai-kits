@@ -150,11 +150,13 @@ The signing CI (master plan step 3.6) is live in
    ```
 
    This catches signer-identity drift before publication.
-5. The strict published-state validator recomputes every descriptor from the
-   exact bytes/modes, verifies both embedded subject digests, and requires all
-   seven packages. Only then does one bot commit add the descriptors, detached
-   bundles, any changed legacy bundles, and `.kit-package-v1-active` together.
-   Release/tag runs are verify-only and reuse the main-identity bundles.
+5. The signer stages only the authorized generated files, writes that exact Git
+   tree, and materializes it as an immutable archive. From the archive, the
+   strict published-state validator recomputes every descriptor from the exact
+   bytes/modes and requires all seven packages; cosign also re-verifies both
+   bundle classes against the pinned SAN and issuer. One bot commit is allowed
+   only when its tree exactly matches that verified tree. Release/tag runs are
+   verify-only and reuse the main-identity bundles.
 
 The current daemon still consumes the legacy manifest path. Complete-package
 consumer verification/atomic installation and the signed catalog snapshot/TUF

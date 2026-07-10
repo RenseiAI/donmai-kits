@@ -385,6 +385,25 @@ class SwapRaceTests(unittest.TestCase):
                 build_descriptor(root, kit_dir)
             self.assertTrue(fired())
 
+    def test_already_read_payload_swap_before_traversal_completion_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            victim = kit_dir / "bin" / "setup.sh"
+            original = root / "original-setup.sh"
+
+            def swap() -> None:
+                os.replace(victim, original)
+                victim.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+                victim.chmod(0o755)
+
+            # `bin/setup.sh` sorts before `data/`; replace the already-read
+            # inode only when the walker later opens that sibling directory.
+            race, fired = self._racing_open("data", swap)
+            with race, self.assertRaisesRegex(PackageError, "after initial inventory"):
+                build_descriptor(root, kit_dir)
+            self.assertTrue(fired())
+
     def test_payload_directory_symlink_swap_between_stat_and_open_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -590,6 +609,30 @@ class DescriptorValidationTests(unittest.TestCase):
 
 
 class CandidateStateTests(unittest.TestCase):
+    def test_version_gate_uses_committed_head_not_a_pathname_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            _publish(root, kit_dir)
+            base = _commit_fixture(root)
+            (kit_dir / "data" / "notes.txt").write_text("changed\n", encoding="utf-8")
+            _commit_changes(root)
+            manifest = kit_dir / "kit.toml"
+            real_read_bytes = Path.read_bytes
+            bumped = manifest.read_bytes().replace(b"1.0.0", b"1.0.1")
+
+            def swapped_read(path: Path) -> bytes:
+                if path == manifest:
+                    return bumped
+                return real_read_bytes(path)
+
+            with (
+                patch.object(Path, "read_bytes", swapped_read),
+                self.assertRaisesRegex(PackageError, "without changing kit.version"),
+            ):
+                _ci_check(root, base)
+            self.assertIn('version = "1.0.0"', manifest.read_text(encoding="utf-8"))
+
     def test_bootstrap_publication_shape_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
