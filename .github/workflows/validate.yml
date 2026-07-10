@@ -50,11 +50,7 @@ jobs:
           fi
 
           if [[ -n "${base_ref}" ]]; then
-            args=(ci-check --base-ref "${base_ref}")
-            if [[ "${GITHUB_ACTOR}" == "github-actions[bot]" ]]; then
-              args+=(--allow-generated-signatures)
-            fi
-            python3 scripts/package_kits.py "${args[@]}"
+            python3 scripts/package_kits.py ci-check --base-ref "${base_ref}"
           elif [[ -f .kit-package-v1-active ]]; then
             python3 scripts/package_kits.py check
           else

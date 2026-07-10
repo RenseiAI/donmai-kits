@@ -4,23 +4,28 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 import unicodedata
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.package_kits import (
     DESCRIPTOR_NAME,
     DESCRIPTOR_SIGNATURE_NAME,
+    EXPECTED_KIT_IDENTITIES,
     PACKAGE_MARKER,
     PACKAGE_MARKER_BYTES,
     PackageError,
     build_descriptor,
     canonical_json_bytes,
     check_catalog,
+    check_publication_worktree,
     check_version_bumps,
     ci_check,
+    discover_kit_dirs,
     ensure_unique_portable_paths,
     generate_catalog,
     portable_collision_key,
@@ -31,6 +36,7 @@ from scripts.package_kits import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_KIT_IDENTITIES = {"demo": "default/demo"}
 
 
 def _fixture_bundle(subject: bytes) -> bytes:
@@ -76,10 +82,37 @@ def _write_kit(root: Path, name: str = "demo") -> Path:
 
 
 def _publish(root: Path, kit_dir: Path) -> None:
-    generate_catalog(root)
+    _generate_catalog(root)
     descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
     (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(descriptor))
     (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+
+
+def _generate_catalog(root: Path):
+    return generate_catalog(root, expected_identities=FIXTURE_KIT_IDENTITIES)
+
+
+def _check_catalog(root: Path, *, allow_legacy_only: bool = False):
+    return check_catalog(
+        root,
+        allow_legacy_only=allow_legacy_only,
+        expected_identities=FIXTURE_KIT_IDENTITIES,
+    )
+
+
+def _ci_check(root: Path, base_ref: str):
+    return ci_check(
+        root,
+        base_ref,
+        expected_identities=FIXTURE_KIT_IDENTITIES,
+    )
+
+
+def _publication_check(root: Path):
+    return check_publication_worktree(
+        root,
+        expected_identities=FIXTURE_KIT_IDENTITIES,
+    )
 
 
 def _rewrite_descriptor(kit_dir: Path, mutate) -> None:
@@ -114,6 +147,43 @@ def _commit_changes(root: Path, message: str = "candidate") -> None:
 
 
 class CurrentCatalogPackageTests(unittest.TestCase):
+    def test_official_catalog_is_exactly_the_authorized_seven(self) -> None:
+        kit_dirs = discover_kit_dirs(ROOT)
+        self.assertEqual(
+            sorted(EXPECTED_KIT_IDENTITIES), [path.name for path in kit_dirs]
+        )
+
+    def test_official_catalog_add_delete_and_id_substitution_fail(self) -> None:
+        def copied_catalog() -> tuple[tempfile.TemporaryDirectory, Path]:
+            temporary = tempfile.TemporaryDirectory()
+            root = Path(temporary.name)
+            shutil.copytree(ROOT / "kits", root / "kits")
+            return temporary, root
+
+        temporary, root = copied_catalog()
+        with temporary:
+            shutil.copytree(root / "kits" / "go", root / "kits" / "extra")
+            with self.assertRaisesRegex(PackageError, "authorized seven-kit set"):
+                discover_kit_dirs(root)
+
+        temporary, root = copied_catalog()
+        with temporary:
+            shutil.rmtree(root / "kits" / "java")
+            with self.assertRaisesRegex(PackageError, "authorized seven-kit set"):
+                discover_kit_dirs(root)
+
+        temporary, root = copied_catalog()
+        with temporary:
+            manifest = root / "kits" / "go" / "kit.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    'id = "default/go"', 'id = "default/substitute"'
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PackageError, "authorized kit.id"):
+                discover_kit_dirs(root)
+
     def test_canonical_json_rejects_non_interoperable_numbers(self) -> None:
         for value in (1.5, 1 << 53):
             with self.subTest(value=value):
@@ -192,7 +262,7 @@ class CurrentCatalogPackageTests(unittest.TestCase):
             _, refreshed_legacy = build_descriptor(root, kit_dir)
             self.assertNotEqual(original, refreshed_legacy)
 
-            generate_catalog(root)
+            _generate_catalog(root)
             package_signature = kit_dir / DESCRIPTOR_SIGNATURE_NAME
             package_signature.write_bytes(_fixture_bundle(b"detached metadata"))
             _, with_package_signature = build_descriptor(root, kit_dir)
@@ -229,6 +299,7 @@ class PortablePathTests(unittest.TestCase):
             "version-control": ".git/config",
             "temporary": ".tmp-payload",
             "installer-marker": ".kit-installing",
+            "activation-marker": PACKAGE_MARKER,
             "reserved-metadata": "nested/kit.package.json",
         }
         for case, path in cases.items():
@@ -278,6 +349,92 @@ class SpecialFileTests(unittest.TestCase):
                 build_descriptor(root, kit_dir)
 
 
+@unittest.skipUnless(
+    hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"),
+    "secure dirfd traversal unavailable",
+)
+class SwapRaceTests(unittest.TestCase):
+    def _racing_open(self, target: str, swap):
+        real_open = os.open
+        fired = False
+
+        def racing_open(path, flags, *args, dir_fd=None, **kwargs):
+            nonlocal fired
+            if not fired and dir_fd is not None and path == target:
+                fired = True
+                swap()
+            return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+        return patch(
+            "scripts.package_kits.os.open", side_effect=racing_open
+        ), lambda: fired
+
+    def test_payload_inode_swap_between_stat_and_open_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            victim = kit_dir / "data" / "notes.txt"
+            original = root / "original-notes.txt"
+
+            def swap() -> None:
+                os.replace(victim, original)
+                victim.write_text("replacement\n", encoding="utf-8")
+
+            race, fired = self._racing_open("notes.txt", swap)
+            with race, self.assertRaisesRegex(PackageError, "changed identity"):
+                build_descriptor(root, kit_dir)
+            self.assertTrue(fired())
+
+    def test_payload_directory_symlink_swap_between_stat_and_open_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            victim = kit_dir / "data"
+            original = root / "original-data"
+
+            def swap() -> None:
+                os.replace(victim, original)
+                os.symlink(original, victim)
+
+            race, fired = self._racing_open("data", swap)
+            with race, self.assertRaisesRegex(PackageError, "securely open directory"):
+                build_descriptor(root, kit_dir)
+            self.assertTrue(fired())
+
+    def test_descriptor_symlink_swap_between_stat_and_open_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            _publish(root, kit_dir)
+            victim = kit_dir / DESCRIPTOR_NAME
+            original = root / "original-descriptor.json"
+
+            def swap() -> None:
+                os.replace(victim, original)
+                os.symlink(original, victim)
+
+            race, fired = self._racing_open(DESCRIPTOR_NAME, swap)
+            with race, self.assertRaisesRegex(PackageError, "securely open regular"):
+                validate_descriptor(root, kit_dir)
+            self.assertTrue(fired())
+
+    def test_bundle_inode_swap_between_stat_and_open_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            victim = kit_dir / "kit.toml.sigstore"
+            original = root / "original-bundle.sigstore"
+
+            def swap() -> None:
+                os.replace(victim, original)
+                victim.write_bytes(_fixture_bundle(b"replacement"))
+
+            race, fired = self._racing_open("kit.toml.sigstore", swap)
+            with race, self.assertRaisesRegex(PackageError, "changed identity"):
+                build_descriptor(root, kit_dir)
+            self.assertTrue(fired())
+
+
 class DescriptorValidationTests(unittest.TestCase):
     def test_published_fixture_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,7 +442,7 @@ class DescriptorValidationTests(unittest.TestCase):
             kit_dir = _write_kit(root)
             _publish(root, kit_dir)
 
-            state, generated = check_catalog(root)
+            state, generated = _check_catalog(root)
 
         self.assertEqual("published", state)
         self.assertEqual(1, len(generated))
@@ -295,26 +452,26 @@ class DescriptorValidationTests(unittest.TestCase):
             root = Path(tmp)
             _write_kit(root)
             with self.assertRaisesRegex(PackageError, "legacy-only package state"):
-                check_catalog(root)
-            state, _ = check_catalog(root, allow_legacy_only=True)
+                _check_catalog(root)
+            state, _ = _check_catalog(root, allow_legacy_only=True)
         self.assertEqual("legacy-only", state)
 
     def test_mixed_descriptor_without_marker_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_kit(root)
-            generate_catalog(root)
+            _generate_catalog(root)
             with self.assertRaisesRegex(PackageError, "mixed package migration state"):
-                check_catalog(root, allow_legacy_only=True)
+                _check_catalog(root, allow_legacy_only=True)
 
     def test_active_state_missing_signature_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_kit(root)
-            generate_catalog(root)
+            _generate_catalog(root)
             (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
             with self.assertRaisesRegex(PackageError, "missing, extra, or misplaced"):
-                check_catalog(root)
+                _check_catalog(root)
 
     def test_invalid_activation_marker_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,7 +480,7 @@ class DescriptorValidationTests(unittest.TestCase):
             _publish(root, kit_dir)
             (root / PACKAGE_MARKER).write_text("legacy", encoding="utf-8")
             with self.assertRaisesRegex(PackageError, "marker bytes are invalid"):
-                check_catalog(root)
+                _check_catalog(root)
 
     def test_extra_payload_file_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,10 +586,54 @@ class DescriptorValidationTests(unittest.TestCase):
             _publish(root, kit_dir)
             (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(b"wrong"))
             with self.assertRaisesRegex(PackageError, "subject digest does not match"):
-                check_catalog(root)
+                _check_catalog(root)
 
 
 class CandidateStateTests(unittest.TestCase):
+    def test_bootstrap_publication_shape_is_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            _commit_fixture(root)
+            _publish(root, kit_dir)
+
+            state, paths = _publication_check(root)
+
+        self.assertEqual("bootstrap-publication", state)
+        self.assertEqual(
+            {
+                PACKAGE_MARKER,
+                f"kits/demo/{DESCRIPTOR_NAME}",
+                f"kits/demo/{DESCRIPTOR_SIGNATURE_NAME}",
+            },
+            set(paths),
+        )
+
+    def test_bootstrap_rejects_a_refreshed_legacy_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            _commit_fixture(root)
+            legacy = kit_dir / "kit.toml.sigstore"
+            bundle = json.loads(legacy.read_text(encoding="utf-8"))
+            bundle["verificationMaterial"]["tlogEntries"][0]["refresh"] = True
+            legacy.write_text(json.dumps(bundle), encoding="utf-8")
+            _publish(root, kit_dir)
+
+            with self.assertRaisesRegex(PackageError, "bootstrap must publish exactly"):
+                _publication_check(root)
+
+    def test_publication_shape_rejects_an_unrelated_root_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = _write_kit(root)
+            _commit_fixture(root)
+            _publish(root, kit_dir)
+            (root / "unrelated.txt").write_text("not signer output\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(PackageError, "unauthorized worktree"):
+                _publication_check(root)
+
     def test_payload_change_requires_version_bump(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -443,7 +644,7 @@ class CandidateStateTests(unittest.TestCase):
             _commit_changes(root)
 
             with self.assertRaisesRegex(PackageError, "without changing kit.version"):
-                ci_check(root, base)
+                _ci_check(root, base)
 
     def test_versioned_payload_change_is_a_signing_pending_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -462,17 +663,17 @@ class CandidateStateTests(unittest.TestCase):
             (kit_dir / "data" / "notes.txt").write_text("changed\n", encoding="utf-8")
             _commit_changes(root)
 
-            state, generated = ci_check(root, base)
+            state, generated = _ci_check(root, base)
 
             (kit_dir / "kit.toml.sigstore").write_bytes(
                 _fixture_bundle(manifest.read_bytes())
             )
-            generate_catalog(root)
+            _generate_catalog(root)
             descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
             (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
                 _fixture_bundle(descriptor)
             )
-            published_state, _ = check_catalog(root)
+            published_state, _ = _check_catalog(root)
 
         self.assertEqual("signing-pending", state)
         self.assertEqual(1, len(generated))
@@ -487,8 +688,11 @@ class CandidateStateTests(unittest.TestCase):
             (kit_dir / DESCRIPTOR_NAME).write_bytes(b"{}")
             _commit_changes(root)
 
-            with self.assertRaisesRegex(PackageError, "CI-generated"):
-                ci_check(root, base)
+            with (
+                patch.dict(os.environ, {"GITHUB_ACTOR": "github-actions[bot]"}),
+                self.assertRaisesRegex(PackageError, "main signing workflow"),
+            ):
+                _ci_check(root, base)
 
     def test_activation_marker_downgrade_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -500,7 +704,7 @@ class CandidateStateTests(unittest.TestCase):
             _commit_changes(root)
 
             with self.assertRaisesRegex(PackageError, "activation is monotonic"):
-                ci_check(root, base)
+                _ci_check(root, base)
 
     def test_historical_version_reuse_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

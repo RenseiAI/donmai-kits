@@ -82,6 +82,10 @@ your last edit and quote each result line in your report.
   post_acquire).
 - Kit identity stays brand-neutral: `author = "donmai"`,
   `authorIdentity = "did:web:donmai.dev"`, `homepage = "https://donmai.dev"`.
+- Package publication is frozen to the seven directory/kit-id pairs encoded in
+  `scripts/package_kits.py`. Do not add, delete, rename, or substitute a kit id
+  until an explicit architecture change lifts the catalog-expansion hold and
+  updates the allowlist in the same reviewed change.
 - `api = "rensei.dev/v1"` is the manifest protocol wire constant the daemon
   parser keys on — preserved verbatim in every manifest; never rename it.
 - After every manifest edit, re-run `python3 scripts/validate_kits.py` before
@@ -155,6 +159,9 @@ scanned file.
 - NEVER fabricate/hand-place a `.sigstore` bundle or edit `kit.package.json`
   -> instead: change payload + bump `kit.version`, then let `sign.yml` generate
   and sign the package on `main`.
+- NEVER expand or shrink the authorized seven-kit set as an ordinary kit PR ->
+  instead: land the prerequisite package/consumer/catalog gates and explicit
+  architecture authorization first.
 - NEVER rename or "de-brand" `api = "rensei.dev/v1"` -> instead: leave it; it
   is a protocol identifier, not a product name.
 - NEVER commit content that hits the Boundary grep -> instead: rewrite it

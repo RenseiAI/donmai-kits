@@ -104,8 +104,17 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           manifests=(kits/*/kit.toml)
-          if [[ "${#manifests[@]}" -eq 0 ]]; then
-            echo "::error::no kits/*/kit.toml manifests found"
+          expected_manifests=(
+            kits/go/kit.toml
+            kits/java/kit.toml
+            kits/python/kit.toml
+            kits/ruby/kit.toml
+            kits/rust/kit.toml
+            kits/ts-nextjs/kit.toml
+            kits/typescript/kit.toml
+          )
+          if [[ "${manifests[*]}" != "${expected_manifests[*]}" ]]; then
+            echo "::error::official publication is frozen to the exact authorized seven manifests"
             exit 1
           fi
 
@@ -149,8 +158,17 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           descriptors=(kits/*/kit.package.json)
-          if [[ "${#descriptors[@]}" -eq 0 ]]; then
-            echo "::error::no kit package descriptors were generated"
+          expected_descriptors=(
+            kits/go/kit.package.json
+            kits/java/kit.package.json
+            kits/python/kit.package.json
+            kits/ruby/kit.package.json
+            kits/rust/kit.package.json
+            kits/ts-nextjs/kit.package.json
+            kits/typescript/kit.package.json
+          )
+          if [[ "${descriptors[*]}" != "${expected_descriptors[*]}" ]]; then
+            echo "::error::generator did not emit the exact authorized seven descriptors"
             exit 1
           fi
 
@@ -197,6 +215,14 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::package publication commits are restricted to a main push"
+            exit 1
+          fi
+          # All bundles were verified above against the exact main SAN+issuer.
+          # Now bind that authenticated run to the only allowed dirty shape.
+          python3 scripts/package_kits.py publication-check
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add \

@@ -110,18 +110,23 @@ uniqueness, path containment, and that every referenced skill / prompt-fragment
 Agent Skills `name` + `description` YAML frontmatter. The package publisher is
 also pure stdlib but requires Python 3.12 or 3.13: those runtimes implement the
 pinned Unicode 15.1-compatible normalization/case-fold profile, whose semantic
-mapping fingerprint the gate verifies. Run the conformance tests after
-validation:
+mapping fingerprint the gate verifies. Publisher validation also requires
+POSIX descriptor-relative `O_NOFOLLOW` traversal; an unsupported host fails
+closed instead of falling back to raceable pathname reads. Run the conformance
+tests after validation:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
 CI also runs the full unittest suite, adversarial package path/link/collision/
-extra/missing/mode cases, version-bump enforcement, and generated-file drift
-checks on every push and PR. During the one-time package activation, the
-package check uses the explicit `--allow-legacy-only` bootstrap state; once the
-main signer commits `.kit-package-v1-active`, legacy-only or mixed states fail.
+extra/missing/mode/race cases, version-bump enforcement, and generated-file
+drift checks on every push and PR. Publication is frozen to the current seven
+directory/kit-id pairs until the architecture expansion hold is explicitly
+lifted; additions, deletions, renames, and id substitutions fail before
+signing. During the one-time package activation, the package check uses the
+explicit `--allow-legacy-only` bootstrap state; once the main signer commits
+`.kit-package-v1-active`, legacy-only or mixed states fail.
 
 ## Signing & trust
 

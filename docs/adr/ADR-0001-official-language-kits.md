@@ -85,7 +85,10 @@ Two cross-cutting facts shape this decision:
    legacy manifest bundle is inventoried and is preserved when unchanged so the
    same kit id/version cannot acquire a new package digest from a signature
    refresh. Package-aware consumer installation and signed catalog snapshots
-   remain separate follow-ups.
+   remain separate follow-ups. Until those expansion prerequisites are
+   accepted, the publisher is fail-closed to the current seven directory/kit-id
+   pairs; an ordinary kit contribution cannot add, delete, rename, or substitute
+   one of them.
 
 5. **Wire `demand.env` end-to-end (follow-up, cross-repo).** Populate the
    composed demand's `env` map (currently always nil from the composer) so

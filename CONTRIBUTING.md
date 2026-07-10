@@ -6,6 +6,12 @@ is mechanical, but a few cross-cutting gotchas bite if you skip them.
 
 ## Authoring a kit
 
+Catalog expansion is currently frozen at the seven authorized directory/kit-id
+pairs. The package generator and signing workflow reject additions, deletions,
+renames, or id substitutions. The steps below apply to maintenance of those
+kits and to a future expansion only after the architecture hold is explicitly
+lifted and the allowlisted set is reviewed in the same change.
+
 1. Create `kits/<lang>/kit.toml` with `api = "rensei.dev/v1"` and the `[kit]`
    identity block. Copy an existing kit (e.g. `kits/go/kit.toml`) as a template.
 2. Declare detection in `[detect]` — exact filenames in `files` (any-exists) and
@@ -34,6 +40,8 @@ The one-time package-v1 activation PR runs the last command with
 bootstrap flag must not be used; deleting or downgrading the marker fails CI.
 Use Python 3.12 or 3.13 for the package gate; it fingerprints the pinned
 Unicode 15.1-compatible full case-fold profile and rejects other runtimes.
+Run it on a POSIX host with descriptor-relative `O_NOFOLLOW` support; the
+publisher refuses a host that cannot provide race-safe no-follow reads.
 
 ### Required contribution surface
 
@@ -122,7 +130,9 @@ The signing CI (master plan step 3.6) is live in
 
 1. Human PRs change only authored payload and bump `kit.version`. CI rejects
    generated descriptor/bundle edits, downgrade/mixed states, missing/extra
-   inventory, path/link/collision/mode attacks, and an unchanged version.
+   inventory, path/link/collision/mode/race attacks, changes to the authorized
+   seven-kit set, and an unchanged version. Actor names never authorize edits
+   to generated trust artifacts.
 2. On `main`, the signer verifies and preserves each unchanged
    `kit.toml.sigstore`. It re-signs a legacy manifest only when `kit.toml`
    actually changed. This is required because the legacy bundle is package

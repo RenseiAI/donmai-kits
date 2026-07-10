@@ -35,9 +35,10 @@ import sys
 import tempfile
 import tomllib
 import unicodedata
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, Mapping
 
 
 PACKAGE_SCHEMA = "donmai.dev/kit-package/v1"
@@ -49,13 +50,22 @@ DESCRIPTOR_NAME = "kit.package.json"
 DESCRIPTOR_SIGNATURE_NAME = "kit.package.json.sigstore"
 PACKAGE_METADATA_NAMES = {DESCRIPTOR_NAME, DESCRIPTOR_SIGNATURE_NAME}
 EXPECTED_PUBLISHER = "did:web:donmai.dev"
+EXPECTED_KIT_IDENTITIES = {
+    "go": "default/go",
+    "java": "default/java",
+    "python": "default/python",
+    "ruby": "default/ruby",
+    "rust": "default/rust",
+    "ts-nextjs": "default/ts-nextjs",
+    "typescript": "default/typescript",
+}
 SIGSTORE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_SAFE_INTEGER = (1 << 53) - 1
 VERSION_CONTROL_NAMES = {".git", ".hg", ".svn"}
 TEMP_SUFFIXES = (".partial", ".tmp")
 TEMP_PREFIXES = (".tmp-", ".kit-staging-")
-INSTALLER_MARKERS = {".kit-installing", ".kit-generation"}
+INSTALLER_MARKERS = {PACKAGE_MARKER, ".kit-installing", ".kit-generation"}
 WINDOWS_RESERVED_BASENAMES = {
     "con",
     "prn",
@@ -80,6 +90,11 @@ ALLOWED_UNICODE_DATA_VERSIONS = {"15.0.0", "15.1.0"}
 UNICODE_15_1_CASEFOLD_FINGERPRINT = (
     "2a17566332a6a1e32afbfd431f9c73a7f30caa22fb4ce881c4e35ebc2b7f2284"
 )
+HAS_SECURE_DIRFD_APIS = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
 
 
 class PackageError(Exception):
@@ -89,6 +104,201 @@ class PackageError(Exception):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PackageError(message)
+
+
+def _directory_open_flags() -> int:
+    """Return the fail-closed flags required for descriptor-relative traversal."""
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    missing = [name for name in required if not hasattr(os, name)]
+    _require(
+        not missing,
+        f"secure package traversal is unsupported on this host (missing {missing})",
+    )
+    _require(
+        HAS_SECURE_DIRFD_APIS,
+        "secure package traversal requires openat/statat and fd-scandir support",
+    )
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _regular_open_flags() -> int:
+    _require(
+        hasattr(os, "O_NOFOLLOW"),
+        "secure package reads require O_NOFOLLOW support",
+    )
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _stable_file_metadata(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _stat_at(directory_fd: int, name: str, label: str) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise PackageError(f"cannot stat {label}: {exc}") from exc
+
+
+@contextmanager
+def _open_root_directory(root: Path) -> Iterator[int]:
+    """Open the repository root without following its final path component."""
+    try:
+        before = root.lstat()
+        descriptor = os.open(root, _directory_open_flags())
+    except OSError as exc:
+        raise PackageError(f"cannot securely open package root {root}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require(
+            stat.S_ISDIR(before.st_mode)
+            and stat.S_ISDIR(opened.st_mode)
+            and _same_inode(before, opened),
+            f"package root {root} changed identity while opening",
+        )
+        yield descriptor
+        after = root.lstat()
+        _require(
+            _same_inode(opened, after) and stat.S_ISDIR(after.st_mode),
+            f"package root {root} changed identity during traversal",
+        )
+    except OSError as exc:
+        raise PackageError(f"cannot revalidate package root {root}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _open_directory_at(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> Iterator[int]:
+    """Open one child directory by dirfd and bind it to the lstat inode."""
+    before = expected if expected is not None else _stat_at(parent_fd, name, label)
+    _require(stat.S_ISDIR(before.st_mode), f"{label} is not a directory")
+    try:
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise PackageError(f"cannot securely open directory {label}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require(
+            stat.S_ISDIR(opened.st_mode) and _same_inode(before, opened),
+            f"directory {label} changed identity while opening",
+        )
+        yield descriptor
+        after = _stat_at(parent_fd, name, label)
+        _require(
+            stat.S_ISDIR(after.st_mode) and _same_inode(opened, after),
+            f"directory {label} changed identity during traversal",
+        )
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _open_relative_directory(root: Path, parts: tuple[str, ...]) -> Iterator[int]:
+    """Open every path component relative to a held repository-root dirfd."""
+    with _open_root_directory(root) as root_fd, ExitStack() as stack:
+        current_fd = root_fd
+        walked: list[str] = []
+        for part in parts:
+            _require(part not in {"", ".", ".."}, "invalid secure path component")
+            walked.append(part)
+            current_fd = stack.enter_context(
+                _open_directory_at(current_fd, part, "/".join(walked))
+            )
+        yield current_fd
+
+
+def _relative_parts(root: Path, path: Path) -> tuple[str, ...]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise PackageError(f"path {path} is outside package root {root}") from exc
+    _require(relative.parts, f"path {path} does not name a package file")
+    return relative.parts
+
+
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    label: str,
+) -> tuple[bytes, os.stat_result]:
+    """Read a regular file through O_NOFOLLOW and reject inode/content swaps."""
+    before = _stat_at(directory_fd, name, label)
+    _require(stat.S_ISREG(before.st_mode), f"{label} is not a regular file")
+    _require(before.st_nlink == 1, f"{label} is hard-linked")
+    try:
+        descriptor = os.open(name, _regular_open_flags(), dir_fd=directory_fd)
+    except OSError as exc:
+        raise PackageError(f"cannot securely open regular file {label}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require(
+            stat.S_ISREG(opened.st_mode)
+            and opened.st_nlink == 1
+            and _same_inode(before, opened),
+            f"regular file {label} changed identity while opening",
+        )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_read = os.fstat(descriptor)
+        after_path = _stat_at(directory_fd, name, label)
+        _require(
+            _stable_file_metadata(before)
+            == _stable_file_metadata(opened)
+            == _stable_file_metadata(after_read)
+            == _stable_file_metadata(after_path),
+            f"regular file {label} changed while reading",
+        )
+        data = b"".join(chunks)
+        _require(
+            len(data) == after_read.st_size,
+            f"regular file {label} size changed while reading",
+        )
+        return data, after_read
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file(root: Path, path: Path) -> tuple[bytes, os.stat_result]:
+    parts = _relative_parts(root, path)
+    with _open_relative_directory(root, parts[:-1]) as directory_fd:
+        return _read_regular_at(
+            directory_fd, parts[-1], path.relative_to(root).as_posix()
+        )
+
+
+def _read_optional_root_file(root: Path, name: str) -> bytes | None:
+    """Read an optional repository-root file without following or racing links."""
+    with _open_relative_directory(root, ()) as root_fd:
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PackageError(f"cannot stat {name}: {exc}") from exc
+        return _read_regular_at(root_fd, name, name)[0]
 
 
 @lru_cache(maxsize=1)
@@ -266,28 +476,19 @@ def _decode_base64(value: Any, label: str) -> bytes:
 
 
 def validate_sigstore_bundle(
+    root: Path,
     bundle_path: Path,
     subject: bytes,
     *,
     require_subject_match: bool = True,
-) -> None:
+) -> bytes:
     """Validate bundle-v0.3 shape and, when required, its embedded subject digest.
 
     This is intentionally not a trust-root or certificate-policy verification;
     the signing workflow runs `cosign verify-blob` for that boundary.
     """
-    try:
-        info = bundle_path.lstat()
-    except OSError as exc:
-        raise PackageError(
-            f"missing signature bundle {bundle_path.name}: {exc}"
-        ) from exc
-    _require(
-        stat.S_ISREG(info.st_mode),
-        f"signature bundle {bundle_path.name} is not regular",
-    )
-    _require(info.st_nlink == 1, f"signature bundle {bundle_path.name} is hard-linked")
-    bundle = strict_json_loads(bundle_path.read_bytes(), bundle_path.name)
+    raw, _ = _read_regular_file(root, bundle_path)
+    bundle = strict_json_loads(raw, bundle_path.name)
     _require(isinstance(bundle, dict), f"{bundle_path.name} must be a JSON object")
     _require(
         bundle.get("mediaType") == SIGSTORE_MEDIA_TYPE,
@@ -343,6 +544,7 @@ def validate_sigstore_bundle(
         isinstance(tlog_entries, list) and len(tlog_entries) > 0,
         f"{bundle_path.name}.verificationMaterial.tlogEntries must be non-empty",
     )
+    return raw
 
 
 def _git_mode_map(root: Path) -> dict[str, str]:
@@ -369,9 +571,8 @@ def _git_mode_map(root: Path) -> dict[str, str]:
 
 
 def _portable_mode(
-    root: Path, path: Path, info: os.stat_result, git_modes: dict[str, str]
+    repo_path: str, info: os.stat_result, git_modes: dict[str, str]
 ) -> str:
-    repo_path = path.relative_to(root).as_posix()
     git_mode = git_modes.get(repo_path)
     if git_mode is not None:
         _require(
@@ -394,16 +595,26 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
     collision_owners: dict[str, str] = {}
     entries: list[dict[str, Any]] = []
 
-    def visit(directory: Path, prefix: str = "") -> None:
+    kit_parts = _relative_parts(root, kit_dir)
+    _require(
+        len(kit_parts) == 2 and kit_parts[0] == "kits",
+        f"kit directory {kit_dir} must be exactly under kits/<kit>",
+    )
+
+    def directory_names(directory_fd: int, label: str) -> list[str]:
         try:
-            children = sorted(
-                os.scandir(directory), key=lambda entry: entry.name.encode("utf-8")
-            )
+            with os.scandir(directory_fd) as iterator:
+                names = [entry.name for entry in iterator]
+            return sorted(names, key=lambda name: name.encode("utf-8"))
         except (OSError, UnicodeEncodeError) as exc:
-            raise PackageError(f"cannot enumerate {directory}: {exc}") from exc
-        for child in children:
-            rel_path = f"{prefix}/{child.name}" if prefix else child.name
-            allow_metadata = prefix == "" and child.name in PACKAGE_METADATA_NAMES
+            raise PackageError(f"cannot enumerate {label}: {exc}") from exc
+
+    def visit(directory_fd: int, prefix: str = "") -> None:
+        label = f"kits/{kit_dir.name}/{prefix}".rstrip("/")
+        initial_names = directory_names(directory_fd, label)
+        for name in initial_names:
+            rel_path = f"{prefix}/{name}" if prefix else name
+            allow_metadata = prefix == "" and name in PACKAGE_METADATA_NAMES
             collision_key = validate_portable_path(
                 rel_path, allow_root_metadata=allow_metadata
             )
@@ -413,13 +624,22 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
                 f"portable path collision: {previous!r} and {rel_path!r}",
             )
             collision_owners[collision_key] = rel_path
-            try:
-                info = child.stat(follow_symlinks=False)
-            except OSError as exc:
-                raise PackageError(f"cannot stat {rel_path}: {exc}") from exc
-            _require(not child.is_symlink(), f"payload path {rel_path!r} is a symlink")
+            info = _stat_at(directory_fd, name, rel_path)
+            _require(
+                not stat.S_ISLNK(info.st_mode),
+                f"payload path {rel_path!r} is a symlink",
+            )
             if stat.S_ISDIR(info.st_mode):
-                visit(Path(child.path), rel_path)
+                repo_path = f"kits/{kit_dir.name}/{rel_path}"
+                indexed_mode = git_modes.get(repo_path)
+                _require(
+                    indexed_mode is None,
+                    f"{repo_path} has unsupported indexed directory/gitlink mode {indexed_mode}",
+                )
+                with _open_directory_at(
+                    directory_fd, name, rel_path, expected=info
+                ) as child_fd:
+                    visit(child_fd, rel_path)
                 continue
             _require(
                 stat.S_ISREG(info.st_mode),
@@ -428,8 +648,7 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
             _require(info.st_nlink == 1, f"payload path {rel_path!r} is hard-linked")
             if rel_path in PACKAGE_METADATA_NAMES:
                 continue
-            path = Path(child.path)
-            data = path.read_bytes()
+            data, stable_info = _read_regular_at(directory_fd, name, rel_path)
             _require(
                 len(data) <= MAX_SAFE_INTEGER,
                 f"payload path {rel_path!r} exceeds the interoperable size limit",
@@ -439,23 +658,29 @@ def _walk_payload(root: Path, kit_dir: Path) -> list[dict[str, Any]]:
                     "path": rel_path,
                     "sha256": hashlib.sha256(data).hexdigest(),
                     "size": len(data),
-                    "mode": _portable_mode(root, path, info, git_modes),
+                    "mode": _portable_mode(
+                        f"kits/{kit_dir.name}/{rel_path}", stable_info, git_modes
+                    ),
                 }
             )
+        _require(
+            directory_names(directory_fd, label) == initial_names,
+            f"payload directory {label} changed during enumeration",
+        )
 
-    visit(kit_dir)
+    with _open_relative_directory(root, kit_parts) as kit_fd:
+        visit(kit_fd)
     entries.sort(key=lambda entry: entry["path"].encode("utf-8"))
     return entries
 
 
-def _manifest_identity(manifest_path: Path) -> tuple[str, str, str]:
+def _manifest_identity(raw: bytes, label: str) -> tuple[str, str, str]:
     try:
-        with manifest_path.open("rb") as handle:
-            manifest = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise PackageError(f"cannot parse {manifest_path}: {exc}") from exc
+        manifest = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise PackageError(f"cannot parse {label}: {exc}") from exc
     kit = manifest.get("kit")
-    _require(isinstance(kit, dict), f"{manifest_path} is missing [kit]")
+    _require(isinstance(kit, dict), f"{label} is missing [kit]")
     kit_id = kit.get("id")
     version = kit.get("version")
     publisher = kit.get("authorIdentity")
@@ -481,19 +706,33 @@ def build_descriptor(
 ) -> tuple[dict[str, Any], bytes]:
     manifest_path = kit_dir / MANIFEST_NAME
     legacy_signature = kit_dir / LEGACY_SIGNATURE_NAME
-    manifest_bytes = manifest_path.read_bytes()
-    validate_sigstore_bundle(
+    manifest_bytes, _ = _read_regular_file(root, manifest_path)
+    legacy_signature_bytes = validate_sigstore_bundle(
+        root,
         legacy_signature,
         manifest_bytes,
         require_subject_match=require_legacy_subject_match,
     )
-    kit_id, version, publisher = _manifest_identity(manifest_path)
+    kit_id, version, publisher = _manifest_identity(manifest_bytes, str(manifest_path))
+    entries = _walk_payload(root, kit_dir)
+    entry_by_path = {entry["path"]: entry for entry in entries}
+    for path, data in (
+        (MANIFEST_NAME, manifest_bytes),
+        (LEGACY_SIGNATURE_NAME, legacy_signature_bytes),
+    ):
+        entry = entry_by_path.get(path)
+        _require(entry is not None, f"payload inventory is missing required {path}")
+        _require(
+            entry["size"] == len(data)
+            and entry["sha256"] == hashlib.sha256(data).hexdigest(),
+            f"{path} changed between trust validation and payload inventory",
+        )
     descriptor = {
         "schema": PACKAGE_SCHEMA,
         "kit": {"id": kit_id, "version": version},
         "publisher": publisher,
         "manifest": MANIFEST_NAME,
-        "entries": _walk_payload(root, kit_dir),
+        "entries": entries,
     }
     return descriptor, canonical_json_bytes(descriptor)
 
@@ -540,15 +779,11 @@ def _entry_map(entries: Any, label: str) -> dict[str, dict[str, Any]]:
     return result
 
 
-def validate_descriptor_structure(kit_dir: Path) -> tuple[bytes, dict[str, Any]]:
+def validate_descriptor_structure(
+    root: Path, kit_dir: Path
+) -> tuple[bytes, dict[str, Any]]:
     descriptor_path = kit_dir / DESCRIPTOR_NAME
-    try:
-        info = descriptor_path.lstat()
-    except OSError as exc:
-        raise PackageError(f"missing {descriptor_path}: {exc}") from exc
-    _require(stat.S_ISREG(info.st_mode), f"{descriptor_path} is not a regular file")
-    _require(info.st_nlink == 1, f"{descriptor_path} is hard-linked")
-    raw = descriptor_path.read_bytes()
+    raw, _ = _read_regular_file(root, descriptor_path)
     parsed = strict_json_loads(raw, str(descriptor_path))
     _require(isinstance(parsed, dict), f"{descriptor_path} must be a JSON object")
     _require(
@@ -577,7 +812,7 @@ def validate_descriptor_structure(kit_dir: Path) -> tuple[bytes, dict[str, Any]]
 
 def validate_descriptor(root: Path, kit_dir: Path) -> bytes:
     descriptor_path = kit_dir / DESCRIPTOR_NAME
-    raw, parsed = validate_descriptor_structure(kit_dir)
+    raw, parsed = validate_descriptor_structure(root, kit_dir)
     actual_entries = _entry_map(parsed.get("entries"), str(descriptor_path))
 
     expected, expected_bytes = build_descriptor(root, kit_dir)
@@ -602,7 +837,11 @@ def validate_descriptor(root: Path, kit_dir: Path) -> bytes:
     return raw
 
 
-def discover_kit_dirs(root: Path) -> list[Path]:
+def discover_kit_dirs(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> list[Path]:
     kits_dir = root / "kits"
     _require(kits_dir.is_dir(), f"missing kits directory at {kits_dir}")
     manifests = sorted(kits_dir.glob(f"*/{MANIFEST_NAME}"))
@@ -611,7 +850,25 @@ def discover_kit_dirs(root: Path) -> list[Path]:
     _require(
         manifests == nested, "kit manifests must live exactly at kits/<kit>/kit.toml"
     )
-    return [manifest.parent for manifest in manifests]
+    kit_dirs = [manifest.parent for manifest in manifests]
+    actual_names = {kit_dir.name for kit_dir in kit_dirs}
+    expected_names = set(expected_identities)
+    _require(
+        actual_names == expected_names,
+        "official package publication is frozen to the authorized seven-kit set; "
+        f"missing={sorted(expected_names - actual_names)}, "
+        f"extra={sorted(actual_names - expected_names)}",
+    )
+    for kit_dir in kit_dirs:
+        manifest_path = kit_dir / MANIFEST_NAME
+        manifest_bytes, _ = _read_regular_file(root, manifest_path)
+        kit_id, _, _ = _manifest_identity(manifest_bytes, str(manifest_path))
+        _require(
+            kit_id == expected_identities[kit_dir.name],
+            f"kits/{kit_dir.name} must retain authorized kit.id "
+            f"{expected_identities[kit_dir.name]!r}, got {kit_id!r}",
+        )
+    return kit_dirs
 
 
 def _package_artifacts(root: Path) -> list[Path]:
@@ -626,11 +883,12 @@ def check_catalog(
     root: Path,
     *,
     allow_legacy_only: bool = False,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[str, list[tuple[str, str]]]:
-    kit_dirs = discover_kit_dirs(root)
-    marker = root / PACKAGE_MARKER
+    kit_dirs = discover_kit_dirs(root, expected_identities=expected_identities)
+    marker_bytes = _read_optional_root_file(root, PACKAGE_MARKER)
     artifacts = _package_artifacts(root)
-    if not marker.exists():
+    if marker_bytes is None:
         _require(
             not artifacts,
             "mixed package migration state: package artifacts exist without activation marker",
@@ -648,11 +906,7 @@ def check_catalog(
         return "legacy-only", generated
 
     _require(
-        marker.is_file() and not marker.is_symlink(),
-        "package activation marker is not regular",
-    )
-    _require(
-        marker.read_bytes() == PACKAGE_MARKER_BYTES,
+        marker_bytes == PACKAGE_MARKER_BYTES,
         "package activation marker bytes are invalid",
     )
     expected_artifacts = {
@@ -670,13 +924,15 @@ def check_catalog(
         descriptor_bytes = validate_descriptor(root, kit_dir)
         generated.append((kit_dir.name, hashlib.sha256(descriptor_bytes).hexdigest()))
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
-        validate_sigstore_bundle(signature_path, descriptor_bytes)
+        validate_sigstore_bundle(root, signature_path, descriptor_bytes)
     return "published", generated
 
 
 def check_signing_candidate(
     root: Path,
     pending_kits: set[str],
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Validate a pre-sign candidate without treating it as published.
 
@@ -687,10 +943,9 @@ def check_signing_candidate(
     signer then refreshes the legacy signature, generates the final descriptor,
     signs it, and runs the strict published check before committing.
     """
-    kit_dirs = discover_kit_dirs(root)
-    marker = root / PACKAGE_MARKER
+    kit_dirs = discover_kit_dirs(root, expected_identities=expected_identities)
     _require(
-        marker.read_bytes() == PACKAGE_MARKER_BYTES,
+        _read_optional_root_file(root, PACKAGE_MARKER) == PACKAGE_MARKER_BYTES,
         "signing candidate requires the active package-v1 marker",
     )
     artifacts = _package_artifacts(root)
@@ -714,14 +969,14 @@ def check_signing_candidate(
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
         if kit_dir.name not in pending_kits:
             descriptor_bytes = validate_descriptor(root, kit_dir)
-            validate_sigstore_bundle(signature_path, descriptor_bytes)
+            validate_sigstore_bundle(root, signature_path, descriptor_bytes)
             generated.append(
                 (kit_dir.name, hashlib.sha256(descriptor_bytes).hexdigest())
             )
             continue
 
-        published_descriptor, _ = validate_descriptor_structure(kit_dir)
-        validate_sigstore_bundle(signature_path, published_descriptor)
+        published_descriptor, _ = validate_descriptor_structure(root, kit_dir)
+        validate_sigstore_bundle(root, signature_path, published_descriptor)
         _, candidate_descriptor = build_descriptor(
             root,
             kit_dir,
@@ -733,9 +988,13 @@ def check_signing_candidate(
     return "signing-pending", generated
 
 
-def generate_catalog(root: Path) -> list[tuple[str, str]]:
+def generate_catalog(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> list[tuple[str, str]]:
     generated: list[tuple[str, str]] = []
-    for kit_dir in discover_kit_dirs(root):
+    for kit_dir in discover_kit_dirs(root, expected_identities=expected_identities):
         _, raw = build_descriptor(root, kit_dir)
         target = kit_dir / DESCRIPTOR_NAME
         with tempfile.NamedTemporaryFile(
@@ -771,6 +1030,75 @@ def _git_file(root: Path, revision: str, path: str) -> bytes | None:
         stderr=subprocess.DEVNULL,
     )
     return result.stdout if result.returncode == 0 else None
+
+
+def _working_tree_paths(root: Path) -> list[str]:
+    """Return ordinary porcelain-v1 paths and reject rename/copy ambiguity."""
+    raw = _git_output(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    paths: list[str] = []
+    for record in (record for record in raw.split(b"\0") if record):
+        _require(
+            len(record) >= 4 and record[2:3] == b" ",
+            "publication worktree contains an unsupported git status record",
+        )
+        status_code = record[:2].decode("ascii", "strict")
+        _require(
+            "R" not in status_code and "C" not in status_code,
+            "publication worktree may not contain renames or copies",
+        )
+        try:
+            path = record[3:].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PackageError(
+                "publication worktree contains a non-UTF-8 path"
+            ) from exc
+        paths.append(path)
+    _require(len(paths) == len(set(paths)), "publication worktree repeats a path")
+    return sorted(paths)
+
+
+def check_publication_worktree(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> tuple[str, list[str]]:
+    """Validate the signer-only dirty shape after full cosign verification."""
+    check_catalog(root, expected_identities=expected_identities)
+    kit_names = sorted(expected_identities)
+    allowed = {PACKAGE_MARKER}
+    for kit_name in kit_names:
+        allowed.update(
+            {
+                f"kits/{kit_name}/{LEGACY_SIGNATURE_NAME}",
+                f"kits/{kit_name}/{DESCRIPTOR_NAME}",
+                f"kits/{kit_name}/{DESCRIPTOR_SIGNATURE_NAME}",
+            }
+        )
+    dirty_paths = _working_tree_paths(root)
+    unauthorized = sorted(set(dirty_paths) - allowed)
+    _require(
+        not unauthorized,
+        f"signer produced unauthorized worktree changes: {unauthorized}",
+    )
+
+    if _git_file(root, "HEAD", PACKAGE_MARKER) is None:
+        expected_bootstrap = {PACKAGE_MARKER}
+        for kit_name in kit_names:
+            expected_bootstrap.update(
+                {
+                    f"kits/{kit_name}/{DESCRIPTOR_NAME}",
+                    f"kits/{kit_name}/{DESCRIPTOR_SIGNATURE_NAME}",
+                }
+            )
+        _require(
+            set(dirty_paths) == expected_bootstrap,
+            "package-v1 bootstrap must publish exactly the activation marker and "
+            f"{len(kit_names) * 2} package descriptor artifacts; "
+            f"missing={sorted(expected_bootstrap - set(dirty_paths))}, "
+            f"extra={sorted(set(dirty_paths) - expected_bootstrap)}",
+        )
+        return "bootstrap-publication", dirty_paths
+    return "publication-update", dirty_paths
 
 
 def _manifest_version(raw: bytes, label: str) -> str:
@@ -890,7 +1218,7 @@ def ci_check(
     root: Path,
     base_ref: str,
     *,
-    allow_generated_signatures: bool = False,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[str, list[tuple[str, str]]]:
     paths = changed_paths(root, base_ref)
     generated_names = {
@@ -902,16 +1230,13 @@ def ci_check(
         path for path in paths if path.split("/")[-1] in generated_names
     )
     _require(
-        allow_generated_signatures or not generated_changes,
-        "package descriptors and detached signatures are CI-generated and cannot "
-        f"change in a human PR: {generated_changes}",
+        not generated_changes,
+        "package descriptors and detached signatures may change only inside the "
+        "main signing workflow after exact cosign identity verification: "
+        f"{generated_changes}",
     )
     base_marker = _git_file(root, base_ref, PACKAGE_MARKER)
-    head_marker = (
-        (root / PACKAGE_MARKER).read_bytes()
-        if (root / PACKAGE_MARKER).exists()
-        else None
-    )
+    head_marker = _read_optional_root_file(root, PACKAGE_MARKER)
     _require(
         not (
             base_marker == PACKAGE_MARKER_BYTES and head_marker != PACKAGE_MARKER_BYTES
@@ -921,7 +1246,11 @@ def ci_check(
     check_version_bumps(root, base_ref, paths)
 
     if head_marker is None:
-        return check_catalog(root, allow_legacy_only=base_marker is None)
+        return check_catalog(
+            root,
+            allow_legacy_only=base_marker is None,
+            expected_identities=expected_identities,
+        )
 
     pending_kits = {
         path.split("/")[1]
@@ -930,9 +1259,11 @@ def ci_check(
         and len(path.split("/")) >= 3
         and path.split("/")[-1] not in generated_names
     }
-    if pending_kits and not allow_generated_signatures:
-        return check_signing_candidate(root, pending_kits)
-    return check_catalog(root)
+    if pending_kits:
+        return check_signing_candidate(
+            root, pending_kits, expected_identities=expected_identities
+        )
+    return check_catalog(root, expected_identities=expected_identities)
 
 
 def _print_result(state: str, generated: list[tuple[str, str]]) -> None:
@@ -961,10 +1292,10 @@ def main(argv: list[str]) -> int:
     check_parser.add_argument("--allow-legacy-only", action="store_true")
 
     subparsers.add_parser("generate")
+    subparsers.add_parser("publication-check")
 
     ci_parser = subparsers.add_parser("ci-check")
     ci_parser.add_argument("--base-ref", required=True)
-    ci_parser.add_argument("--allow-generated-signatures", action="store_true")
 
     args = parser.parse_args(argv[1:])
     root = args.root.resolve()
@@ -973,12 +1304,15 @@ def main(argv: list[str]) -> int:
             generated = generate_catalog(root)
             _print_result("generated", generated)
             return 0
-        if args.command == "ci-check":
-            state, generated = ci_check(
-                root,
-                args.base_ref,
-                allow_generated_signatures=args.allow_generated_signatures,
+        if args.command == "publication-check":
+            state, paths = check_publication_worktree(root)
+            print(
+                f"package_kits: {state} shape passed "
+                f"({len(paths)} generated worktree paths)"
             )
+            return 0
+        if args.command == "ci-check":
+            state, generated = ci_check(root, args.base_ref)
             _print_result(state, generated)
             return 0
         state, generated = check_catalog(
