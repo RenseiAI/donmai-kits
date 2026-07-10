@@ -94,8 +94,17 @@ python3 scripts/validate_kits.py        # validates every kits/*/kit.toml
 
 The validator (pure stdlib, Python 3.11+) checks each manifest against the
 manifest schema: the `api` constant, required identity fields, OS/arch enums,
-composition `order` enum, command keys, and that every referenced skill /
-prompt-fragment / hook script resolves on disk. CI runs it on every push and PR.
+composition `order` enum, command keys, catalog-wide kit/skill identity
+uniqueness, path containment, and that every referenced skill / prompt-fragment
+/ hook script resolves on disk. Referenced `SKILL.md` files must carry valid
+Agent Skills `name` + `description` YAML frontmatter. Run the conformance tests
+after validation:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+CI runs both gates on every push and PR.
 
 ## Signing & trust
 

@@ -1,8 +1,13 @@
-# SKILL: Python Debugging
+---
+name: python-debugging
+description: Diagnose Python import, environment, type-check, lint, collection, and test failures. Use when pytest, mypy, ruff, or module loading fails or hangs.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: python-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# Python Debugging
 
 ## Overview
 

@@ -1,8 +1,13 @@
-# SKILL: Java Debugging
+---
+name: java-debugging
+description: Diagnose Java compile, Maven, Gradle, dependency, JDK-version, and test failures. Use when JVM project builds fail, hang, or resolve incompatible artifacts.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: java-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# Java Debugging
 
 ## Overview
 

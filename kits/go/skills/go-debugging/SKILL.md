@@ -1,8 +1,13 @@
-# SKILL: Go Debugging
+---
+name: go-debugging
+description: Diagnose Go build, vet, test, race, and module-resolution failures. Use when Go commands fail, hang, or report dependency and checksum drift.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: go-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# Go Debugging
 
 ## Overview
 

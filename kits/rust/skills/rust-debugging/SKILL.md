@@ -1,8 +1,13 @@
-# SKILL: Rust Debugging
+---
+name: rust-debugging
+description: Diagnose Rust compile, borrow-checker, trait, Clippy, formatting, and test failures. Use when Cargo commands fail or report lifetime, bound, lint, or test errors.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: rust-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# Rust Debugging
 
 ## Overview
 

@@ -1,8 +1,13 @@
-# SKILL: TypeScript Debugging
+---
+name: typescript-debugging
+description: Diagnose TypeScript compile, module-resolution, declaration, isolated-module, build, and type-check failures. Use when npm or TypeScript gates fail in a Node project.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: typescript-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# TypeScript Debugging
 
 ## Overview
 

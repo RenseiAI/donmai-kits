@@ -18,9 +18,13 @@ is mechanical, but a few cross-cutting gotchas bite if you skip them.
    install-scripts' job; the two streams run in order: install → post_acquire).
 5. Add at least one `SKILL.md` under `skills/<id>/` and a conventions partial
    under `partials/` so the skill-load and prompt-fragment paths are exercised.
+   `SKILL.md` must start with Agent Skills YAML frontmatter containing `name`
+   (lowercase/hyphenated and identical to `<id>`) and a non-empty `description`
+   that says what the skill does and when to use it.
 6. Set `[composition].order` — `foundation` for a base language, `framework` for
    a framework that composes on top of a foundation kit.
-7. Run the validator: `python3 scripts/validate_kits.py`.
+7. Run `python3 scripts/validate_kits.py`, then
+   `python3 -m unittest discover -s tests -v`.
 
 ### Required contribution surface
 

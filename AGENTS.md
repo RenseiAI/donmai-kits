@@ -41,6 +41,7 @@ When a row matches, read that doc before your next edit and follow it literally.
 
 ```bash
 python3 scripts/validate_kits.py    # schema validation — pure stdlib, Python 3.11+
+python3 -m unittest discover -s tests -v  # validator + Agent Skills conformance
 ```
 
 Then run the Boundary grep below — CI's `oss-clean` job fails the build on any
@@ -66,6 +67,9 @@ your last edit and quote each result line in your report.
   per-OS `[provide.toolchain_install]` (`.linux` minimum), a `post_acquire`
   hook, `[provide.tool_permissions]`, ≥1 skill, ≥1 prompt fragment, and
   `[provide.workarea_config]` (`clean_dirs` + `preserve_dirs`).
+- Every referenced `SKILL.md` starts with Agent Skills YAML frontmatter. Its
+  required `name` matches both the skill directory and manifest `id`, and its
+  non-empty `description` explains what the skill does and when to use it.
 - `post_acquire` fetches framework dependencies only — never the base
   toolchain (that is `toolchain_install`'s job; order is install →
   post_acquire).
