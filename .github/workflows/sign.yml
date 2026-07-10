@@ -1,49 +1,47 @@
 name: sign
 
-# Keyless Sigstore signing of the official kit catalog (master plan step 3.6).
+# Main-only keyless signing for both compatibility manifests and complete kit
+# package descriptors. Package ordering is load-bearing:
 #
-# On push to main (and on tagged releases / manual dispatch) this workflow
-# uses GitHub Actions OIDC + cosign to keyless-sign every `kits/*/kit.toml`,
-# producing a sibling `<kit>.kit.toml.sigstore` bundle next to each manifest.
-# No long-lived keys exist: cosign exchanges the job's OIDC token for a
-# short-lived Fulcio certificate, signs the manifest digest, records the
-# entry in the Rekor transparency log, and packages everything into a
-# self-contained Sigstore bundle.
+#   1. preserve + verify an unchanged kit.toml.sigstore bundle;
+#   2. re-sign it only when kit.toml changed (which CI requires to accompany a
+#      kit.version bump for any payload change);
+#   3. generate canonical kit.package.json after the legacy bundle is stable;
+#   4. sign + verify kit.package.json; and
+#   5. stage every descriptor/bundle plus the activation marker;
+#   6. verify an immutable archive of that exact Git tree; and
+#   7. commit only when the resulting commit has that verified tree.
 #
-# The execution-layer daemon's bundle-mode verifier reads the sibling
-# `.sigstore` file, hashes the manifest, and verifies the bundle against the
-# embedded (public-good Fulcio/Rekor) trust root plus its default issuer
-# allowlist. The allowlisted signer identity is THIS workflow's OIDC subject:
-#
-#   SAN    = https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main
-#   issuer = https://token.actions.githubusercontent.com
-#
-# That pair is baked into the daemon's default `trust.issuerSet`, so official
-# kits install under the default `signed-by-allowlist` trust mode WITHOUT the
-# `--allow-unsigned` override. See CONTRIBUTING.md § "Signing model" and
-# docs/adr/ADR-0001 for the end-to-end flow.
+# The descriptor inventories kit.toml.sigstore, so refreshing an unchanged
+# legacy bundle would change package identity at the same kit id/version. The
+# workflow therefore never performs nondeterministic signature refreshes.
+# kit.package.json.sigstore is detached package metadata and is not inventoried,
+# avoiding a signature self-reference. The accepted package contract is
+# donmai-architecture/ADR-2026-07-10-deterministic-kit-packages-and-command-composition.md.
 
 on:
   push:
     branches: [main]
     paths:
-      - "kits/**/kit.toml"
+      - "kits/**"
+      - "scripts/package_kits.py"
+      - "tests/test_package_integrity.py"
       - ".github/workflows/sign.yml"
   release:
     types: [published]
   workflow_dispatch:
 
-# OIDC keyless signing requires `id-token: write`; committing the bundles
-# back to main on push requires `contents: write`.
 permissions:
   contents: write
   id-token: write
 
-# Never run two signing passes concurrently against the same ref — the
-# second push-back would race the first.
 concurrency:
   group: sign-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  EXPECTED_SAN: "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
+  EXPECTED_ISSUER: "https://token.actions.githubusercontent.com"
 
 jobs:
   validate:
@@ -53,126 +51,241 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Never sign a catalog that doesn't pass schema validation.
-      - name: Validate every kit.toml against the schema
-        run: python3 scripts/validate_kits.py
+      - name: Validate manifests, skills, and package candidate state
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_kits.py
+          python3 -m unittest discover -s tests -v
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && -n "${BEFORE_SHA:-}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            python3 scripts/package_kits.py ci-check --base-ref "${BEFORE_SHA}"
+          elif [[ -f .kit-package-v1-active ]]; then
+            python3 scripts/package_kits.py check
+          else
+            python3 scripts/package_kits.py check --allow-legacy-only
+          fi
 
   sign:
-    name: keyless-sign the kit catalog
+    name: keyless-sign complete kit packages
     needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # Use the default GITHUB_TOKEN so the bundle push-back is
-          # authenticated; fetch full history is unnecessary.
           persist-credentials: true
+          fetch-depth: 0
 
-      # Install cosign. The Sigstore-maintained installer pins a known-good
-      # cosign release; no long-lived keys are introduced.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
 
-      - name: Keyless-sign each kit.toml into a sibling .sigstore bundle
+      - name: Require a publishable ref
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::manual package verification is restricted to refs/heads/main"
+            exit 1
+          fi
+
+      - name: Preserve or sign legacy manifest compatibility bundles
         env:
-          # cosign reads the OIDC token from the Actions runtime; setting
-          # COSIGN_EXPERIMENTAL is no longer required on cosign v2+, but we
-          # force non-interactive keyless mode explicitly.
+          BEFORE_SHA: ${{ github.event.before }}
           COSIGN_YES: "true"
         run: |
           set -euo pipefail
           shopt -s nullglob
-          signed=0
-          for manifest in kits/*/kit.toml; do
-            bundle="${manifest}.sigstore"
-            echo "::group::sign ${manifest}"
-            # Keyless sign-blob over the raw manifest bytes. cosign hashes
-            # the artifact (sha256), exchanges the Actions OIDC token for a
-            # short-lived Fulcio cert, logs to Rekor, and writes a
-            # self-contained Sigstore bundle the daemon verifier consumes.
-            #
-            # --new-bundle-format is REQUIRED: the execution-layer daemon
-            # parses the protobuf Sigstore bundle (mediaType
-            # application/vnd.dev.sigstore.bundle...+json) via sigstore-go's
-            # bundle.LoadJSONFromPath. cosign's legacy --bundle blob format
-            # ({base64Signature,cert,rekorBundle}) is NOT parseable by that
-            # verifier and would read as signed-but-unverified.
-            cosign sign-blob \
-              --yes \
-              --new-bundle-format=true \
-              --bundle "${bundle}" \
-              "${manifest}"
-            echo "wrote ${bundle}"
-            signed=$((signed + 1))
-            echo "::endgroup::"
-          done
-          if [ "${signed}" -eq 0 ]; then
-            echo "::error::no kits/*/kit.toml manifests found to sign"
+          manifests=(kits/*/kit.toml)
+          expected_manifests=(
+            kits/go/kit.toml
+            kits/java/kit.toml
+            kits/python/kit.toml
+            kits/ruby/kit.toml
+            kits/rust/kit.toml
+            kits/ts-nextjs/kit.toml
+            kits/typescript/kit.toml
+          )
+          if [[ "${manifests[*]}" != "${expected_manifests[*]}" ]]; then
+            echo "::error::official publication is frozen to the exact authorized seven manifests"
             exit 1
           fi
-          echo "signed ${signed} kit manifest(s)"
 
-      # Sanity-check: every signed bundle must verify against the same
-      # keyless identity the daemon allowlists, BEFORE we publish it. This
-      # catches a drift between the workflow's actual OIDC subject and the
-      # identity the daemon trusts.
-      - name: Verify each bundle against the official signer identity
+          for manifest in "${manifests[@]}"; do
+            bundle="${manifest}.sigstore"
+            changed=false
+            if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" && -n "${BEFORE_SHA:-}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              if ! git diff --quiet "${BEFORE_SHA}" HEAD -- "${manifest}"; then
+                changed=true
+              fi
+            fi
+
+            echo "::group::legacy ${manifest}"
+            if [[ "${changed}" == "true" || ! -f "${bundle}" ]]; then
+              if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+                echo "::error::${manifest} needs a new legacy signature, but only a main push may issue the allowlisted identity"
+                exit 1
+              fi
+              cosign sign-blob \
+                --yes \
+                --new-bundle-format=true \
+                --bundle "${bundle}" \
+                "${manifest}"
+            fi
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${manifest}"
+            echo "::endgroup::"
+          done
+
+      - name: Generate deterministic package descriptors
+        run: python3 scripts/package_kits.py generate
+
+      - name: Sign or preserve package descriptor bundles
         env:
-          EXPECTED_SAN: "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
-          EXPECTED_ISSUER: "https://token.actions.githubusercontent.com"
+          COSIGN_YES: "true"
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # On a release/tag the SAN ref differs (refs/tags/...), so only
-          # enforce the exact main-ref SAN on a push to main. Other event
-          # types still verify the issuer + repo-scoped SAN regex.
-          for manifest in kits/*/kit.toml; do
-            bundle="${manifest}.sigstore"
-            echo "::group::verify ${manifest}"
-            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-              cosign verify-blob \
-                --new-bundle-format=true \
-                --bundle "${bundle}" \
-                --certificate-identity "${EXPECTED_SAN}" \
-                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
-                "${manifest}"
-            else
-              cosign verify-blob \
-                --new-bundle-format=true \
-                --bundle "${bundle}" \
-                --certificate-identity-regexp "^https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@" \
-                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
-                "${manifest}"
+          descriptors=(kits/*/kit.package.json)
+          expected_descriptors=(
+            kits/go/kit.package.json
+            kits/java/kit.package.json
+            kits/python/kit.package.json
+            kits/ruby/kit.package.json
+            kits/rust/kit.package.json
+            kits/ts-nextjs/kit.package.json
+            kits/typescript/kit.package.json
+          )
+          if [[ "${descriptors[*]}" != "${expected_descriptors[*]}" ]]; then
+            echo "::error::generator did not emit the exact authorized seven descriptors"
+            exit 1
+          fi
+
+          for descriptor in "${descriptors[@]}"; do
+            bundle="${descriptor}.sigstore"
+            needs_signature=false
+            if ! git cat-file -e "HEAD:${descriptor}" 2>/dev/null; then
+              needs_signature=true
+            elif ! git diff --quiet HEAD -- "${descriptor}"; then
+              needs_signature=true
+            elif [[ ! -f "${bundle}" ]]; then
+              needs_signature=true
             fi
+
+            echo "::group::package ${descriptor}"
+            if [[ "${needs_signature}" == "true" ]]; then
+              if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+                echo "::error::${descriptor} needs a trusted package signature, but this event is verify-only"
+                exit 1
+              fi
+              cosign sign-blob \
+                --yes \
+                --new-bundle-format=true \
+                --bundle "${bundle}" \
+                "${descriptor}"
+            fi
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${descriptor}"
             echo "::endgroup::"
           done
 
-      # Commit the bundles back to main on push. On release/tag events the
-      # bundles are produced for the workflow's verify step and uploaded as
-      # an artifact rather than committed (the tag ref is immutable).
-      - name: Commit signed bundles back to main
+      - name: Activate and fail-closed validate the published package set
+        run: |
+          set -euo pipefail
+          printf '%s' '{"schema":"donmai.dev/kit-package/v1","state":"active"}' > .kit-package-v1-active
+          python3 scripts/validate_kits.py
+          python3 scripts/package_kits.py check
+
+      - name: Verify immutable package tree and commit it back to main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::package publication commits are restricted to a main push"
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add kits/*/kit.toml.sigstore
+          git add \
+            .kit-package-v1-active \
+            kits/*/kit.toml.sigstore \
+            kits/*/kit.package.json \
+            kits/*/kit.package.json.sigstore
+
+          # Bind the signer output to the only allowed dirty shape before
+          # deriving the candidate Git tree. Authored payload remains the
+          # already-reviewed HEAD tree; only generated publication files are
+          # staged here.
+          python3 scripts/package_kits.py publication-check
           if git diff --cached --quiet; then
-            echo "no bundle changes to commit"
+            echo "no package publication changes to commit"
             exit 0
           fi
-          git commit -m "chore(sign): refresh kit Sigstore bundles [skip ci]"
+
+          candidate_tree="$(git write-tree)"
+          snapshot="$(mktemp -d)"
+          trap 'rm -rf "${snapshot}"' EXIT
+          git archive --format=tar "${candidate_tree}" | tar -xf - -C "${snapshot}"
+
+          # This archive, not the mutable Actions worktree, is the publication
+          # authority. Recompute every inventory and re-verify both signature
+          # classes against the exact bytes and modes in the candidate tree.
+          python3 "${snapshot}/scripts/validate_kits.py"
+          python3 "${snapshot}/scripts/package_kits.py" check
+
+          kits=(go java python ruby rust ts-nextjs typescript)
+          for kit in "${kits[@]}"; do
+            manifest="${snapshot}/kits/${kit}/kit.toml"
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${manifest}.sigstore" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${manifest}"
+
+            descriptor="${snapshot}/kits/${kit}/kit.package.json"
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${descriptor}.sigstore" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${descriptor}"
+          done
+
+          if [[ "$(git write-tree)" != "${candidate_tree}" ]]; then
+            echo "::error::staged publication changed during immutable-tree verification"
+            exit 1
+          fi
+          git commit -m "chore(sign): publish signed kit packages [skip ci]"
+          if [[ "$(git rev-parse 'HEAD^{tree}')" != "${candidate_tree}" ]]; then
+            echo "::error::publication commit does not contain the verified candidate tree"
+            exit 1
+          fi
           git push
 
-      - name: Upload bundles as a build artifact
+      - name: Upload signed packages as a build artifact
         if: github.event_name != 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: kit-sigstore-bundles
-          path: kits/*/kit.toml.sigstore
+          name: signed-kit-packages
+          path: |
+            .kit-package-v1-active
+            kits/*/**
           if-no-files-found: error

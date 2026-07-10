@@ -23,10 +23,10 @@ Two cross-cutting facts shape this decision:
    `permissive`. The daemon does NOT ship an empty allowlist: at startup it seeds
    `trust.issuerSet` with the official kit-signing identity (the
    `defaultVendorIssuerSet()` default). The signing CI and the embedded
-   public-good Sigstore trust root have both landed, so every official kit ships a
-   real sibling `.sigstore` bundle and installs under `signed-by-allowlist`
-   without `--allow-unsigned`. The gate fails closed only for unsigned or
-   untrusted-signer kits (typically third-party or locally-built ones).
+   public-good Sigstore trust root have both landed, so every official kit
+   manifest ships a real sibling `.sigstore` bundle and passes the legacy
+   manifest `signed-by-allowlist` gate without `--allow-unsigned`. That does not
+   bind referenced payload or establish complete-package installation.
 2. **Kits are execution-layer content.** A kit is a declarative detection +
    toolchain + commands + skills contract with no server side and no platform
    dependency. Per the OSS line ("client/execution + contracts are OSS;
@@ -70,11 +70,28 @@ Two cross-cutting facts shape this decision:
    per kit (`cosign sign-blob --new-bundle-format`). The daemon's compiled-in
    `defaultVendorIssuerSet()` pins that workflow's exact Fulcio SAN
    (`…/sign.yml@refs/heads/main`) + OIDC issuer, and the embedded public-good
-   Sigstore trust root verifies the chain offline. The result: official kits
-   install under the default `signed-by-allowlist` mode without `--allow-unsigned`.
+   Sigstore trust root verifies the chain offline. The result is
+   `legacy-manifest-verified` integrity for official manifest bytes under the
+   default `signed-by-allowlist` gate without `--allow-unsigned`.
    (The "vendor trust root" here is the embedded public-good root narrowed by the
    pinned vendor signer identity — a self-hosted Fulcio is not used, because a
    GitHub-OIDC-issued cert can only validate against the public-good root.)
+
+   **2026-07-10 package addendum.** The accepted full-package contract now lives
+   in
+   [`donmai-architecture/ADR-2026-07-10-deterministic-kit-packages-and-command-composition.md`](https://github.com/RenseiAI/donmai-architecture/blob/main/ADR-2026-07-10-deterministic-kit-packages-and-command-composition.md).
+   The publisher generates a canonical descriptor covering every payload path,
+   digest, size, and portable mode, then keyless-signs that descriptor. The
+   legacy manifest bundle is inventoried and is preserved when unchanged so the
+   same kit id/version cannot acquire a new package digest from a signature
+   refresh. The signer stages only authorized publication files, materializes
+   the exact candidate Git tree as an immutable archive, and validates every
+   inventory plus both signature classes from that archive. It commits only if
+   the resulting commit tree is exactly the verified tree. Package-aware
+   consumer installation and signed catalog snapshots remain separate
+   follow-ups. Until those expansion prerequisites are accepted, the publisher
+   is fail-closed to the current seven directory/kit-id pairs; an ordinary kit
+   contribution cannot add, delete, rename, or substitute one of them.
 
 5. **Wire `demand.env` end-to-end (follow-up, cross-repo).** Populate the
    composed demand's `env` map (currently always nil from the composer) so
@@ -86,14 +103,12 @@ Two cross-cutting facts shape this decision:
 
 - OSS users get language coverage out of the box; the platform consumes the
   catalog rather than authoring kits.
-- The signing CI signs the whole catalog in one pass, and a single parity
-  fixture can guard composer drift across the layer.
-- The trust gate is usable for official kits today — the compiled-in vendor
-  trust root realizes the security change's intent rather than working around it.
-- These kits are **signed** — each ships a `kit.toml.sigstore` bundle — and
-  install under the default `signed-by-allowlist` mode with no `--allow-unsigned`
-  and no `permissive` opt-out. Those overrides remain only for unsigned
-  third-party kits.
+- The signing CI verifies stable legacy bundles, generates deterministic
+  complete-file descriptors, signs them, and publishes the package set
+  atomically.
+- The legacy manifest trust gate remains usable today. Package signature
+  publication does not claim that the current installer verifies or activates
+  complete packages.
 
 ## Open questions
 
