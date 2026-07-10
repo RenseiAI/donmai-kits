@@ -13,12 +13,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.package_kits import (
+    CATALOG_CANDIDATE_SCHEMA,
     DESCRIPTOR_NAME,
     DESCRIPTOR_SIGNATURE_NAME,
     EXPECTED_KIT_IDENTITIES,
+    EXPECTED_MANIFEST_API,
+    EXPECTED_PACKAGE_SIGNER_POLICY,
+    PACKAGE_SCHEMA,
     PACKAGE_MARKER,
     PACKAGE_MARKER_BYTES,
     PackageError,
+    _record_catalog_identity,
+    build_catalog_snapshot_candidate,
     build_descriptor,
     canonical_json_bytes,
     check_catalog,
@@ -271,6 +277,154 @@ class CurrentCatalogPackageTests(unittest.TestCase):
             )
             _, with_refreshed_package_signature = build_descriptor(root, kit_dir)
             self.assertEqual(with_package_signature, with_refreshed_package_signature)
+
+
+class CatalogCandidateTests(unittest.TestCase):
+    REVISION = "1" * 40
+
+    def _build(self, **overrides):
+        arguments = {"source_revision": self.REVISION, "sequence": 1}
+        arguments.update(overrides)
+        return build_catalog_snapshot_candidate(ROOT, **arguments)
+
+    def _copy_published_catalog(self, destination: Path) -> None:
+        shutil.copytree(ROOT / "kits", destination / "kits")
+        shutil.copyfile(ROOT / PACKAGE_MARKER, destination / PACKAGE_MARKER)
+
+    def test_two_builds_are_byte_and_digest_identical(self) -> None:
+        first = self._build()
+        second = self._build()
+        self.assertEqual(first, second)
+        self.assertEqual(hashlib.sha256(first[0]).hexdigest(), first[1])
+
+    def test_discovery_order_does_not_affect_candidate(self) -> None:
+        locators = [
+            f"kits/{name}/{DESCRIPTOR_NAME}" for name in EXPECTED_KIT_IDENTITIES
+        ]
+        forward = self._build(descriptor_locators=locators)
+        reverse = self._build(descriptor_locators=reversed(locators))
+        self.assertEqual(forward, reverse)
+
+    def test_exact_seven_rows_agree_with_published_descriptors(self) -> None:
+        raw, _ = self._build()
+        candidate = json.loads(raw)
+        signing_workflow = (ROOT / ".github" / "workflows" / "sign.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'EXPECTED_SAN: "{EXPECTED_PACKAGE_SIGNER_POLICY["identity"]}"',
+            signing_workflow,
+        )
+        self.assertIn(
+            f'EXPECTED_ISSUER: "{EXPECTED_PACKAGE_SIGNER_POLICY["issuer"]}"',
+            signing_workflow,
+        )
+        self.assertEqual(CATALOG_CANDIDATE_SCHEMA, candidate["schema"])
+        self.assertEqual("unsigned-candidate", candidate["state"])
+        self.assertEqual(self.REVISION, candidate["sourceRevision"])
+        self.assertEqual(1, candidate["sequence"])
+        self.assertEqual(7, len(candidate["packages"]))
+
+        expected_ids = sorted(EXPECTED_KIT_IDENTITIES.values())
+        self.assertEqual(
+            expected_ids, [row["kit"]["id"] for row in candidate["packages"]]
+        )
+        for row in candidate["packages"]:
+            descriptor_path = ROOT / row["descriptor"]
+            descriptor = json.loads(descriptor_path.read_bytes())
+            manifest = (descriptor_path.parent / descriptor["manifest"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(descriptor["kit"], row["kit"])
+            self.assertEqual(
+                hashlib.sha256(descriptor_path.read_bytes()).hexdigest(),
+                row["packageDigest"],
+            )
+            self.assertEqual(EXPECTED_PACKAGE_SIGNER_POLICY, row["packageSignerPolicy"])
+            self.assertEqual(
+                {
+                    "kitPackageSchema": PACKAGE_SCHEMA,
+                    "kitManifestApi": EXPECTED_MANIFEST_API,
+                },
+                row["compatibility"],
+            )
+            self.assertIn(f'api = "{EXPECTED_MANIFEST_API}"', manifest)
+
+    def test_malformed_revision_sequence_and_locator_fail_closed(self) -> None:
+        cases = (
+            {"source_revision": "short"},
+            {"source_revision": "A" * 40},
+            {"source_revision": "1" * 39},
+            {"sequence": 0},
+            {"sequence": -1},
+            {"sequence": True},
+            {"sequence": 1 << 53},
+            {"descriptor_locators": ["../kit.package.json"] * 7},
+            {"descriptor_locators": ["kits/go/other.json"] * 7},
+            {"descriptor_locators": [f"kits/go/{DESCRIPTOR_NAME}"] * 7},
+            {"descriptor_locators": []},
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), self.assertRaises(PackageError):
+                self._build(**arguments)
+
+    def test_duplicate_and_equivocating_identities_fail_closed(self) -> None:
+        identity = ("default/shared", "1.0.0")
+        identities: dict[tuple[str, str], str] = {}
+        _record_catalog_identity(identities, identity, "a" * 64)
+        with self.assertRaisesRegex(PackageError, "duplicate package identity"):
+            _record_catalog_identity(identities, identity, "a" * 64)
+
+        identities = {}
+        _record_catalog_identity(identities, identity, "a" * 64)
+        with self.assertRaisesRegex(PackageError, "equivocation"):
+            _record_catalog_identity(identities, identity, "b" * 64)
+
+    def test_unsupported_package_schema_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_published_catalog(root)
+            descriptor_path = root / "kits" / "go" / DESCRIPTOR_NAME
+            descriptor = json.loads(descriptor_path.read_bytes())
+            descriptor["schema"] = "donmai.dev/kit-package/v999"
+            descriptor_path.write_bytes(canonical_json_bytes(descriptor))
+            (descriptor_path.parent / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+                _fixture_bundle(descriptor_path.read_bytes())
+            )
+            with self.assertRaisesRegex(PackageError, "unsupported schema"):
+                build_catalog_snapshot_candidate(
+                    root, source_revision=self.REVISION, sequence=1
+                )
+
+    def test_unsupported_manifest_api_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_published_catalog(root)
+            manifest = root / "kits" / "go" / "kit.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    'api = "rensei.dev/v1"', 'api = "rensei.dev/v999"'
+                ),
+                encoding="utf-8",
+            )
+            (manifest.parent / "kit.toml.sigstore").write_bytes(
+                _fixture_bundle(manifest.read_bytes())
+            )
+            descriptor, descriptor_bytes = build_descriptor(root, manifest.parent)
+            self.assertEqual("donmai.dev/kit-package/v1", descriptor["schema"])
+            (manifest.parent / DESCRIPTOR_NAME).write_bytes(descriptor_bytes)
+            (manifest.parent / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+                _fixture_bundle(descriptor_bytes)
+            )
+            with self.assertRaisesRegex(PackageError, "manifest api"):
+                build_catalog_snapshot_candidate(
+                    root, source_revision=self.REVISION, sequence=1
+                )
+
+    def test_digest_is_sensitive_to_revision_and_sequence(self) -> None:
+        baseline = self._build()
+        self.assertNotEqual(baseline[1], self._build(source_revision="2" * 40)[1])
+        self.assertNotEqual(baseline[1], self._build(sequence=2)[1])
 
 
 class PortablePathTests(unittest.TestCase):

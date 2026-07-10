@@ -42,6 +42,7 @@ from typing import Any, Iterable, Iterator, Mapping
 
 
 PACKAGE_SCHEMA = "donmai.dev/kit-package/v1"
+CATALOG_CANDIDATE_SCHEMA = "donmai.dev/kit-catalog-candidate/v1"
 PACKAGE_MARKER = ".kit-package-v1-active"
 PACKAGE_MARKER_BYTES = b'{"schema":"donmai.dev/kit-package/v1","state":"active"}'
 MANIFEST_NAME = "kit.toml"
@@ -50,6 +51,11 @@ DESCRIPTOR_NAME = "kit.package.json"
 DESCRIPTOR_SIGNATURE_NAME = "kit.package.json.sigstore"
 PACKAGE_METADATA_NAMES = {DESCRIPTOR_NAME, DESCRIPTOR_SIGNATURE_NAME}
 EXPECTED_PUBLISHER = "did:web:donmai.dev"
+EXPECTED_PACKAGE_SIGNER_POLICY = {
+    "identity": "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main",
+    "issuer": "https://token.actions.githubusercontent.com",
+}
+EXPECTED_MANIFEST_API = "rensei.dev/v1"
 EXPECTED_KIT_IDENTITIES = {
     "go": "default/go",
     "java": "default/java",
@@ -61,6 +67,7 @@ EXPECTED_KIT_IDENTITIES = {
 }
 SIGSTORE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FULL_GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_SAFE_INTEGER = (1 << 53) - 1
 VERSION_CONTROL_NAMES = {".git", ".hg", ".svn"}
 TEMP_SUFFIXES = (".partial", ".tmp")
@@ -942,6 +949,149 @@ def check_catalog(
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
         validate_sigstore_bundle(root, signature_path, descriptor_bytes)
     return "published", generated
+
+
+def _record_catalog_identity(
+    identities: dict[tuple[str, str], str],
+    identity: tuple[str, str],
+    package_digest: str,
+) -> None:
+    """Reject duplicate or equivocating package identities in one snapshot."""
+    prior_digest = identities.get(identity)
+    if prior_digest is not None:
+        _require(
+            prior_digest == package_digest,
+            "catalog candidate package equivocation for "
+            f"{identity[0]!r} version {identity[1]!r}",
+        )
+        raise PackageError(
+            "catalog candidate contains duplicate package identity "
+            f"{identity[0]!r} version {identity[1]!r}"
+        )
+    identities[identity] = package_digest
+
+
+def build_catalog_snapshot_candidate(
+    root: Path,
+    *,
+    source_revision: str,
+    sequence: int,
+    descriptor_locators: Iterable[str] | None = None,
+) -> tuple[bytes, str]:
+    """Return an unsigned canonical catalog candidate and its SHA-256 digest.
+
+    This is deliberately an offline precursor, not publication metadata. It
+    consumes only a complete, already-published package state and does not
+    write, sign, fetch, or assign trust to its result.
+    """
+    _require(
+        isinstance(source_revision, str)
+        and FULL_GIT_REVISION_RE.fullmatch(source_revision) is not None,
+        "catalog source_revision must be a full lowercase 40-hex Git revision",
+    )
+    _require(
+        isinstance(sequence, int)
+        and not isinstance(sequence, bool)
+        and 1 <= sequence <= MAX_SAFE_INTEGER,
+        "catalog sequence must be a positive interoperable integer",
+    )
+    state, _ = check_catalog(root, expected_identities=EXPECTED_KIT_IDENTITIES)
+    _require(state == "published", "catalog candidate requires published packages")
+
+    if descriptor_locators is None:
+        locators = [
+            f"kits/{name}/{DESCRIPTOR_NAME}"
+            for name in sorted(EXPECTED_KIT_IDENTITIES)
+        ]
+    else:
+        locators = list(descriptor_locators)
+    _require(
+        len(locators) == len(EXPECTED_KIT_IDENTITIES),
+        "catalog candidate must consume exactly the authorized descriptor count",
+    )
+
+    expected_locators = {
+        f"kits/{name}/{DESCRIPTOR_NAME}" for name in EXPECTED_KIT_IDENTITIES
+    }
+    seen_locators: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    identities: dict[tuple[str, str], str] = {}
+    for locator in locators:
+        _require(isinstance(locator, str), "descriptor locator must be a string")
+        locator_parent, separator, locator_name = locator.rpartition("/")
+        _require(
+            separator == "/" and locator_name == DESCRIPTOR_NAME,
+            f"descriptor locator {locator!r} must name {DESCRIPTOR_NAME}",
+        )
+        validate_portable_path(locator_parent)
+        _require(
+            locator in expected_locators,
+            f"descriptor locator {locator!r} is not an authorized published descriptor",
+        )
+        _require(
+            locator not in seen_locators,
+            f"catalog candidate contains duplicate descriptor locator {locator!r}",
+        )
+        seen_locators.add(locator)
+
+        kit_dir = root / Path(locator).parent
+        descriptor_bytes = validate_descriptor(root, kit_dir)
+        descriptor = strict_json_loads(descriptor_bytes, locator)
+        kit = descriptor["kit"]
+        identity = (kit["id"], kit["version"])
+        package_digest = hashlib.sha256(descriptor_bytes).hexdigest()
+        _record_catalog_identity(identities, identity, package_digest)
+
+        manifest_bytes, _ = _read_regular_file(root, kit_dir / descriptor["manifest"])
+        try:
+            manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise PackageError(f"cannot parse {locator} manifest: {exc}") from exc
+        _require(
+            manifest.get("api") == EXPECTED_MANIFEST_API,
+            f"{locator} manifest api is not {EXPECTED_MANIFEST_API!r}",
+        )
+        manifest_entry = _entry_map(descriptor["entries"], locator).get(
+            descriptor["manifest"]
+        )
+        _require(
+            manifest_entry is not None
+            and manifest_entry["sha256"] == hashlib.sha256(manifest_bytes).hexdigest(),
+            f"{locator} manifest compatibility subject does not match its descriptor",
+        )
+        rows.append(
+            {
+                "kit": {"id": identity[0], "version": identity[1]},
+                "descriptor": locator,
+                "packageDigest": package_digest,
+                "packageSignerPolicy": EXPECTED_PACKAGE_SIGNER_POLICY,
+                "compatibility": {
+                    "kitPackageSchema": PACKAGE_SCHEMA,
+                    "kitManifestApi": EXPECTED_MANIFEST_API,
+                },
+            }
+        )
+
+    _require(
+        seen_locators == expected_locators,
+        "catalog candidate descriptor inventory is incomplete or substituted",
+    )
+    rows.sort(
+        key=lambda row: (
+            row["kit"]["id"].encode("utf-8"),
+            row["kit"]["version"].encode("utf-8"),
+            row["packageDigest"].encode("ascii"),
+        )
+    )
+    candidate = {
+        "schema": CATALOG_CANDIDATE_SCHEMA,
+        "state": "unsigned-candidate",
+        "sourceRevision": source_revision,
+        "sequence": sequence,
+        "packages": rows,
+    }
+    canonical = canonical_json_bytes(candidate)
+    return canonical, hashlib.sha256(canonical).hexdigest()
 
 
 def check_signing_candidate(
