@@ -35,6 +35,9 @@ jobs:
       - name: Validate every kit.toml against the schema
         run: python3 scripts/validate_kits.py
 
+      - name: Test catalog and Agent Skills conformance
+        run: python3 -m unittest discover -s tests -v
+
   oss-clean:
     name: OSS-clean (no private references)
     runs-on: ubuntu-latest

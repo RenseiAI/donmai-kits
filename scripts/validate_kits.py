@@ -5,11 +5,12 @@ manifest schema.
 The schema this enforces is the one the OSS execution-layer daemon actually
 parses (the `kitManifestTOML` struct in the daemon's kit registry) plus the
 constraints documented in the kit-manifest spec (`005-kit-manifest-spec.md` in
-the architecture corpus). We deliberately keep this validator structural and
-permissive in the same way the daemon decoder is permissive: unknown fields are
-ignored (forward-compatible), but the fields we DO know about must have the
+the architecture corpus). We deliberately keep manifest validation structural
+and permissive in the same way the daemon decoder is permissive: unknown fields
+are ignored (forward-compatible), but the fields we DO know about must have the
 right shape, and on-disk file references (skills, prompt fragments, hooks) must
-resolve.
+resolve. Referenced SKILL.md files are additionally validated against the
+required Agent Skills frontmatter contract (name + description).
 
 Pure stdlib — uses `tomllib` (Python 3.11+). No third-party dependencies, so CI
 needs nothing but a Python runtime.
@@ -22,9 +23,11 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 # The protocol/api version string the manifest must declare. This is the wire
 # contract constant carried by every manifest (`api = "rensei.dev/v1"`); it is a
@@ -37,6 +40,16 @@ VALID_ARCH = {"x86_64", "arm64"}
 VALID_ORDER = {"foundation", "framework", "project"}
 # build / test / validate are the canonical command keys (005 § Contributions).
 VALID_COMMAND_KEYS = {"build", "test", "validate"}
+SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+YAML_NON_STRING_PLAIN_RE = re.compile(
+    r"^(?:null|true|false|yes|no|on|off|~|"
+    r"[-+]?(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+|"
+    r"(?:\d[\d_]*)(?:\.[\d_]*)?(?:e[-+]?\d[\d_]*)?|"
+    r"\.\d[\d_]*(?:e[-+]?\d[\d_]*)?|\.inf|\.nan)|"
+    r"[-+]?\d+(?::[0-5]?\d)+(?:\.\d+)?|"
+    r"\d{4}-\d{1,2}-\d{1,2}(?:[tT ][0-9:.+\-zZ ]*)?)$",
+    re.IGNORECASE,
+)
 
 
 class KitError(Exception):
@@ -56,6 +69,167 @@ def _is_str_map(value: object) -> bool:
     return isinstance(value, dict) and all(
         isinstance(k, str) and isinstance(v, str) for k, v in value.items()
     )
+
+
+def _parse_yaml_string(value: str) -> tuple[str | None, str | None]:
+    """Parse the strict YAML-string subset accepted for required metadata.
+
+    Supporting the full YAML grammar would require a non-stdlib dependency.
+    The hermetic gate instead accepts plain strings, JSON-compatible YAML
+    double-quoted strings, and YAML single-quoted strings. It rejects values
+    that YAML would type as a collection, number, boolean, null, tag, alias, or
+    malformed quoted scalar. Block strings are handled by the caller.
+    """
+    value = value.strip()
+    if not value:
+        return None, "must be a non-empty YAML string"
+
+    if value.startswith('"'):
+        if len(value) < 2 or not value.endswith('"'):
+            return None, "has an unterminated double-quoted string"
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None, "contains an invalid double-quoted string"
+        if not isinstance(parsed, str):
+            return None, "must be a YAML string"
+        return parsed, None
+
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            return None, "has an unterminated single-quoted string"
+        inner = value[1:-1]
+        if "'" in inner.replace("''", ""):
+            return None, "contains an invalid single-quoted string"
+        return inner.replace("''", "'"), None
+
+    if value.startswith(("- ", "? ", ": ")) or value[0] in "[],{}#&*!|>'%@`":
+        return None, "must be a scalar YAML string, not a collection, tag, alias, or directive"
+    if value[0] in {'"', "'"} or value[-1] in {'"', "'"}:
+        return None, "contains an unmatched quote"
+    if ": " in value or value.endswith(":") or " #" in value:
+        return None, "plain YAML strings containing colon/comment syntax must be quoted"
+    if YAML_NON_STRING_PLAIN_RE.fullmatch(value):
+        return None, "must be quoted because YAML would not parse it as a string"
+    return value, None
+
+
+def _skill_frontmatter_fields(frontmatter: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Extract required top-level Agent Skills scalar fields.
+
+    This is not a general YAML parser. It recognizes only the top-level `name`
+    and `description` scalars the official specification requires, while
+    allowing arbitrary optional YAML fields to pass through for forward
+    compatibility. A malformed or unsupported required scalar fails closed.
+    """
+    fields: dict[str, str] = {}
+    errors: list[str] = []
+    i = 0
+    while i < len(frontmatter):
+        raw = frontmatter[i]
+        i += 1
+        if not raw or raw[0].isspace() or raw.lstrip().startswith("#"):
+            continue
+        if ":" not in raw:
+            continue
+        key, raw_value = raw.split(":", 1)
+        key = key.strip()
+        if key not in {"name", "description"}:
+            continue
+        if key in fields:
+            errors.append(f"frontmatter.{key}: duplicate field")
+            continue
+        value = raw_value.strip()
+        if value in {"|", ">", "|-", ">-", "|+", ">+"}:
+            if key == "name":
+                errors.append("frontmatter.name: block strings are not supported")
+                continue
+            block: list[str] = []
+            while i < len(frontmatter):
+                candidate = frontmatter[i]
+                if candidate and not candidate[0].isspace():
+                    break
+                block.append(candidate.strip())
+                i += 1
+            value = " ".join(part for part in block if part)
+            if not value:
+                errors.append(f"frontmatter.{key}: block string must be non-empty")
+                continue
+            fields[key] = value
+            continue
+
+        parsed, parse_error = _parse_yaml_string(value)
+        if parse_error:
+            errors.append(f"frontmatter.{key}: {parse_error}")
+            continue
+        if parsed is not None:
+            fields[key] = parsed
+    return fields, errors
+
+
+def validate_skill(skill_path: Path, expected_id: str | None = None) -> tuple[list[str], str | None]:
+    """Validate one SKILL.md against agentskills.io's required v1 surface.
+
+    Returns (errors, parsed_name). The body is otherwise intentionally
+    unrestricted, matching the upstream specification.
+    """
+    if skill_path.name != "SKILL.md":
+        return [f"skill entrypoint must be named `SKILL.md`, got {skill_path.name!r}"], None
+
+    try:
+        content = skill_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return [f"failed to read: {exc}"], None
+
+    lines = content.splitlines()
+    if not lines or lines[0] != "---":
+        return ["must start with YAML frontmatter delimiter `---`"], None
+
+    try:
+        close_idx = next(i for i in range(1, len(lines)) if lines[i] == "---")
+    except StopIteration:
+        return ["frontmatter is missing its closing `---` delimiter"], None
+
+    fields, errors = _skill_frontmatter_fields(lines[1:close_idx])
+    name = fields.get("name", "")
+    description = fields.get("description", "")
+
+    if not name:
+        errors.append("frontmatter.name: required non-empty string")
+    else:
+        if len(name) > 64:
+            errors.append("frontmatter.name: must be at most 64 characters")
+        if not SKILL_NAME_RE.fullmatch(name):
+            errors.append("frontmatter.name: use lowercase letters, numbers, and single hyphens only")
+        if name != skill_path.parent.name:
+            errors.append(
+                f"frontmatter.name: {name!r} must match parent directory {skill_path.parent.name!r}"
+            )
+        if expected_id and name != expected_id:
+            errors.append(f"frontmatter.name: {name!r} must match manifest skill id {expected_id!r}")
+
+    if not description:
+        errors.append("frontmatter.description: required non-empty string")
+    elif len(description) > 1024:
+        errors.append("frontmatter.description: must be at most 1024 characters")
+
+    if not any(line.strip() for line in lines[close_idx + 1 :]):
+        errors.append("body: must contain Markdown instructions after frontmatter")
+
+    return errors, name or None
+
+
+def _contained_file(kit_dir: Path, file_ref: str) -> Path | None:
+    """Resolve a referenced asset without allowing traversal outside its kit."""
+    windows_ref = PureWindowsPath(file_ref)
+    if windows_ref.drive or windows_ref.is_absolute():
+        return None
+    try:
+        candidate = (kit_dir / file_ref.replace("\\", "/")).resolve()
+        candidate.relative_to(kit_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
 
 
 def validate_kit(kit_toml: Path) -> list[str]:
@@ -219,8 +393,10 @@ def validate_kit(kit_toml: Path) -> list[str]:
         file_ref = pf.get("file")
         if not isinstance(file_ref, str):
             err(f"[[provide.prompt_fragments]][{i}]: requires a string `file`")
-        elif not (kit_dir / file_ref).is_file():
-            err(f"[[provide.prompt_fragments]][{i}]: file {file_ref!r} does not exist on disk")
+        elif _contained_file(kit_dir, file_ref) is None:
+            err(
+                f"[[provide.prompt_fragments]][{i}]: file {file_ref!r} must exist inside the kit directory"
+            )
 
     # skills — array of { file (, id) }; file must exist
     for i, sk in enumerate(provide.get("skills", []) or []):
@@ -228,10 +404,25 @@ def validate_kit(kit_toml: Path) -> list[str]:
             err(f"[[provide.skills]][{i}]: must be a table")
             continue
         file_ref = sk.get("file")
+        skill_id = sk.get("id")
+        if skill_id is not None and (not isinstance(skill_id, str) or not skill_id.strip()):
+            err(f"[[provide.skills]][{i}].id: must be a non-empty string when present")
+            skill_id = None
         if not isinstance(file_ref, str):
             err(f"[[provide.skills]][{i}]: requires a string `file`")
-        elif not (kit_dir / file_ref).is_file():
-            err(f"[[provide.skills]][{i}]: SKILL file {file_ref!r} does not exist on disk")
+        else:
+            skill_path = _contained_file(kit_dir, file_ref)
+            if skill_path is None:
+                err(
+                    f"[[provide.skills]][{i}]: SKILL file {file_ref!r} must exist inside the kit directory"
+                )
+            else:
+                skill_errors, _ = validate_skill(
+                    skill_path,
+                    expected_id=skill_id if isinstance(skill_id, str) else None,
+                )
+                for skill_error in skill_errors:
+                    err(f"[[provide.skills]][{i}] {file_ref}: {skill_error}")
 
     # hooks — generic + OS-keyed; referenced scripts must exist on disk when
     # they look like a path (contain a slash or a known script extension).
@@ -298,9 +489,61 @@ def _check_hook_files(hooks: dict, kit_dir: Path, err, scope: str = "") -> None:
         )
         if looks_like_path:
             # Normalise windows-style separators for the on-disk check.
-            rel = val.replace("\\", "/")
-            if not (kit_dir / rel).is_file():
-                err(f"{prefix}.{hook_key}: script {val!r} does not exist on disk")
+            if _contained_file(kit_dir, val) is None:
+                err(f"{prefix}.{hook_key}: script {val!r} must exist inside the kit directory")
+
+
+def validate_catalog(root: Path, kit_tomls: list[Path] | None = None) -> dict[Path, list[str]]:
+    """Validate per-kit structure plus catalog-wide identity uniqueness."""
+    if kit_tomls is None:
+        kits_dir = root / "kits"
+        search_root = kits_dir if kits_dir.is_dir() else root
+        kit_tomls = sorted(search_root.rglob("kit.toml"))
+
+    errors_by_path = {kit_toml: validate_kit(kit_toml) for kit_toml in kit_tomls}
+    kit_id_owners: dict[str, list[Path]] = {}
+    skill_name_owners: dict[str, list[Path]] = {}
+
+    for kit_toml in kit_tomls:
+        try:
+            with kit_toml.open("rb") as fh:
+                manifest = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, OSError):
+            # The per-kit parser already reports the useful error.
+            continue
+
+        kit_section = manifest.get("kit", {})
+        kit_id = kit_section.get("id") if isinstance(kit_section, dict) else None
+        if isinstance(kit_id, str) and kit_id:
+            kit_id_owners.setdefault(kit_id, []).append(kit_toml)
+
+        provide = manifest.get("provide", {})
+        skills = provide.get("skills", []) if isinstance(provide, dict) else []
+        for skill in skills or []:
+            if not isinstance(skill, dict) or not isinstance(skill.get("file"), str):
+                continue
+            skill_path = _contained_file(kit_toml.parent, skill["file"])
+            if skill_path is None:
+                continue
+            _, parsed_name = validate_skill(skill_path)
+            if parsed_name:
+                skill_name_owners.setdefault(parsed_name, []).append(kit_toml)
+
+    for kit_id, owners in kit_id_owners.items():
+        if len(owners) > 1:
+            owner_list = ", ".join(str(path.relative_to(root)) for path in owners)
+            for owner in owners:
+                errors_by_path[owner].append(f"catalog: duplicate kit id {kit_id!r} in {owner_list}")
+
+    for skill_name, owners in skill_name_owners.items():
+        if len(owners) > 1:
+            owner_list = ", ".join(str(path.relative_to(root)) for path in owners)
+            for owner in owners:
+                errors_by_path[owner].append(
+                    f"catalog: duplicate Agent Skill name {skill_name!r} in {owner_list}"
+                )
+
+    return errors_by_path
 
 
 def main(argv: list[str]) -> int:
@@ -313,12 +556,11 @@ def main(argv: list[str]) -> int:
         print(f"validate_kits: no kit.toml found under {search_root}", file=sys.stderr)
         return 2
 
-    total = 0
+    errors_by_path = validate_catalog(root, kit_tomls)
     failed = 0
     for kit_toml in kit_tomls:
-        total += 1
         rel = kit_toml.relative_to(root)
-        errors = validate_kit(kit_toml)
+        errors = errors_by_path[kit_toml]
         if errors:
             failed += 1
             print(f"FAIL  {rel}")
@@ -328,7 +570,7 @@ def main(argv: list[str]) -> int:
             print(f"OK    {rel}")
 
     print()
-    print(f"validate_kits: {total - failed}/{total} kits passed")
+    print(f"validate_kits: {len(kit_tomls) - failed}/{len(kit_tomls)} kits passed")
     return 1 if failed else 0
 
 

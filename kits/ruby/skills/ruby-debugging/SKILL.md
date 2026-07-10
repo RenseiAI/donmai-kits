@@ -1,8 +1,13 @@
-# SKILL: Ruby Debugging
+---
+name: ruby-debugging
+description: Diagnose Ruby load, Bundler resolution, RuboCop, and RSpec failures. Use when gem installation, requires, linting, or Ruby tests fail or hang.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: ruby-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# Ruby Debugging
 
 ## Overview
 

@@ -1,8 +1,13 @@
-# SKILL: TypeScript / Next.js Debugging
+---
+name: ts-nextjs-debugging
+description: Diagnose TypeScript and Next.js type, build, module, React Server Component, test, and hydration failures. Use when Next.js or pnpm gates fail or runtime boundaries break.
+license: MIT
+metadata:
+  author: donmai
+  version: "1.0.0"
+---
 
-**id**: ts-nextjs-debugging
-**version**: 1.0.0
-**conformsTo**: agentskills.io/specification/v1
+# TypeScript and Next.js Debugging
 
 ## Overview
 
