@@ -60,11 +60,15 @@ foundation + one framework — and they compose `foundation → framework`.
 kits/
   <lang>/
     kit.toml                       # the manifest (the contract)
+    kit.toml.sigstore              # legacy manifest-only compatibility bundle
+    kit.package.json               # canonical signed full-file inventory
+    kit.package.json.sigstore      # detached package-descriptor bundle
     bin/setup.sh, bin/setup.cmd    # post_acquire hook scripts (posix + windows)
     partials/<name>.yaml           # prompt fragments
     skills/<id>/SKILL.md           # skill definitions
 scripts/
   validate_kits.py                 # schema validator (stdlib, runs in CI)
+  package_kits.py                  # deterministic package generator/validator
 .github/workflows/validate.yml     # validates every kit.toml + OSS-clean grep
 docs/adr/                          # architecture decision records
 ```
@@ -82,6 +86,11 @@ donmai kit install --source <git-url> # install from a git source (signature-gat
 donmai kit enable default/python
 ```
 
+That command surface is the explicit legacy compatibility path today: it
+installs/verifies the manifest, not the complete package. Do not copy a
+descriptor without its inventoried payload and detached package bundle. The
+package-aware atomic installer remains a separate consumer migration.
+
 To use a kit from this catalog directly, copy its `kit.toml` (renamed to
 `<id>.kit.toml`, slashes → `__`) and its referenced files into the scan path, or
 point a local `.kit.toml` manifest at it from inside a project workarea.
@@ -90,6 +99,7 @@ point a local `.kit.toml` manifest at it from inside a project workarea.
 
 ```bash
 python3 scripts/validate_kits.py        # validates every kits/*/kit.toml
+python3 scripts/package_kits.py check   # validates every published package
 ```
 
 The validator (pure stdlib, Python 3.11+) checks each manifest against the
@@ -97,36 +107,55 @@ manifest schema: the `api` constant, required identity fields, OS/arch enums,
 composition `order` enum, command keys, catalog-wide kit/skill identity
 uniqueness, path containment, and that every referenced skill / prompt-fragment
 / hook script resolves on disk. Referenced `SKILL.md` files must carry valid
-Agent Skills `name` + `description` YAML frontmatter. Run the conformance tests
-after validation:
+Agent Skills `name` + `description` YAML frontmatter. The package publisher is
+also pure stdlib but requires Python 3.12 or 3.13: those runtimes implement the
+pinned Unicode 15.1-compatible normalization/case-fold profile, whose semantic
+mapping fingerprint the gate verifies. Run the conformance tests after
+validation:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-CI runs both gates on every push and PR.
+CI also runs the full unittest suite, adversarial package path/link/collision/
+extra/missing/mode cases, version-bump enforcement, and generated-file drift
+checks on every push and PR. During the one-time package activation, the
+package check uses the explicit `--allow-legacy-only` bootstrap state; once the
+main signer commits `.kit-package-v1-active`, legacy-only or mixed states fail.
 
 ## Signing & trust
 
-Kit installs are signature-gated. The execution layer verifies a sibling
-`<manifest>.sigstore` bundle against a trust root and an issuer allowlist, and
-the default trust mode (`signed-by-allowlist`) refuses unsigned kits.
+Historic kit installs are manifest-signature-gated. The current execution
+layer verifies a sibling `<manifest>.sigstore` bundle against a trust root and
+issuer allowlist. That establishes `legacy-manifest-verified`, not complete
+package integrity.
 
-**Signing is live.** On every merge to `main` that touches a manifest,
-[`.github/workflows/sign.yml`](./.github/workflows/sign.yml) keyless-signs
-every `kits/*/kit.toml` with cosign (GitHub Actions OIDC → Fulcio → Rekor,
-`--new-bundle-format=true`) and commits the sibling `kit.toml.sigstore`
-bundle back to `main`. No long-lived keys exist. The allowlisted signer
-identity is that workflow's own OIDC subject:
+**Complete-package publishing is main-only and keyless.** On relevant merges,
+[`.github/workflows/sign.yml`](./.github/workflows/sign.yml) verifies and
+preserves unchanged legacy bundles, signs only changed/version-bumped
+manifests, generates each RFC-8785-canonical `kit.package.json`, and keyless
+signs the descriptor with cosign (GitHub Actions OIDC → Fulcio → Rekor,
+bundle v0.3). No long-lived keys exist. The allowlisted signer identity is the
+workflow's own OIDC subject:
 
 ```
 SAN    = https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main
 issuer = https://token.actions.githubusercontent.com
 ```
 
-That pair is baked into the daemon's default `trust.issuerSet`, so the
-official kits in this catalog install cleanly under the default
-`signed-by-allowlist` mode with no override.
+The package descriptor inventories every payload file — including the stable
+legacy manifest bundle — by normalized path, SHA-256, byte size, and portable
+mode. The descriptor excludes itself and its detached signature to avoid a
+cycle. The workflow signs in that exact order, verifies both bundle classes,
+then atomically commits all seven package publications plus the activation
+marker.
+
+That identity pair is baked into the daemon's default `trust.issuerSet` for
+the legacy manifest gate. The current daemon installer has not yet implemented
+complete-package verification/atomic activation, so it must continue to report
+the weaker legacy trust state. A signed catalog snapshot/TUF publisher and the
+package-aware consumer migration are separate follow-ups; this repository does
+not claim them here.
 
 Trust modes (daemon-wide):
 
@@ -140,9 +169,10 @@ issuer allowlist, the gate fails **closed** — no kit installs. The audit-logge
 `donmai kit install --allow-unsigned` override (or flipping to `permissive`)
 is the only bypass.
 
-`.sigstore` bundles are never hand-placed or fabricated — CI emits them. To
-refresh a bundle, merge the manifest change to `main` and let `sign.yml` sign
-it. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) § "Signing model" and
+`.sigstore` bundles and `kit.package.json` are never hand-placed or edited — CI
+emits them. Change package payload only with a `kit.version` bump; the main
+workflow then updates the legacy bundle when needed, regenerates the descriptor,
+and signs it. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) § "Signing model" and
 [`docs/adr/ADR-0001-official-language-kits.md`](./docs/adr/ADR-0001-official-language-kits.md).
 
 ## Contributing

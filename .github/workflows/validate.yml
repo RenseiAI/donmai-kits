@@ -1,16 +1,12 @@
 name: validate
 
-# Validates every kit.toml in the catalog against the kit manifest schema on
-# every push and pull request. Pure-stdlib Python validator — no dependency
-# install step, so the job stays fast and hermetic.
+# Validates every kit manifest and deterministic package descriptor on every
+# push and pull request. Pure-stdlib Python validators keep the gate hermetic.
 #
-# Keyless Sigstore signing (master plan step 3.6) lives in the sibling
-# `sign.yml` workflow: on push to main / release it keyless-signs each
-# kit.toml with cosign (GitHub Actions OIDC → Fulcio → Rekor) and emits the
-# sibling `<kit>.kit.toml.sigstore` bundle the daemon verifier consumes. This
-# workflow stays scoped to schema validation + OSS-clean hygiene so it remains
-# fast and side-effect-free on every PR. See CONTRIBUTING.md § "Signing model"
-# and docs/adr/ADR-0001 for the end-to-end `signed-by-allowlist` flow.
+# Keyless Sigstore signing lives in `sign.yml`. Human PRs never edit generated
+# descriptors or detached bundles: this workflow validates the payload and
+# version-bump candidate, while the main-only signer publishes the exact
+# descriptor/bundle set and activation marker atomically.
 
 on:
   push:
@@ -23,10 +19,12 @@ permissions:
 
 jobs:
   validate-schema:
-    name: validate kit manifests
+    name: validate kit manifests and packages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -37,6 +35,31 @@ jobs:
 
       - name: Test catalog and Agent Skills conformance
         run: python3 -m unittest discover -s tests -v
+
+      - name: Validate deterministic package inventory and publication state
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base_ref=""
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            base_ref="${PR_BASE_SHA}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" && -n "${PUSH_BEFORE_SHA:-}" && ! "${PUSH_BEFORE_SHA}" =~ ^0+$ ]]; then
+            base_ref="${PUSH_BEFORE_SHA}"
+          fi
+
+          if [[ -n "${base_ref}" ]]; then
+            args=(ci-check --base-ref "${base_ref}")
+            if [[ "${GITHUB_ACTOR}" == "github-actions[bot]" ]]; then
+              args+=(--allow-generated-signatures)
+            fi
+            python3 scripts/package_kits.py "${args[@]}"
+          elif [[ -f .kit-package-v1-active ]]; then
+            python3 scripts/package_kits.py check
+          else
+            python3 scripts/package_kits.py check --allow-legacy-only
+          fi
 
   oss-clean:
     name: OSS-clean (no private references)
@@ -63,6 +86,7 @@ jobs:
               --include='*.sh' \
               --include='*.cmd' \
               --include='*.json' \
+              --include='*.py' \
               --exclude-dir='.git' \
               --exclude='validate.yml' \
               --exclude='CONTRIBUTING.md' \

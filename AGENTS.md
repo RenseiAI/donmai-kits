@@ -19,10 +19,11 @@ the OSS execution-layer daemon's kit registry.
 - `scripts/validate_kits.py` mirrors the daemon parser: permissive on unknown
   fields (forward-compatible), strict on known shapes, and every referenced
   skill/prompt-fragment/hook script must resolve on disk.
-- STALE-DOC WARNING: `README.md` § "Signing & trust" and `CONTRIBUTING.md`
-  § "intended flow (NOT YET IMPLEMENTED)" predate the live signing CI —
-  `.github/workflows/sign.yml` signs today and `kits/*/kit.toml.sigstore`
-  bundles are committed. The workflow is authoritative on signing.
+- Package integrity is governed by
+  `../donmai-architecture/ADR-2026-07-10-deterministic-kit-packages-and-command-composition.md`.
+  `kit.toml.sigstore` is an explicit legacy manifest-only compatibility
+  artifact; `kit.package.json` plus its detached bundle is the complete-package
+  trust subject. `.github/workflows/sign.yml` is authoritative on ordering.
 
 ## Before you start — read in this order
 
@@ -42,7 +43,13 @@ When a row matches, read that doc before your next edit and follow it literally.
 ```bash
 python3 scripts/validate_kits.py    # schema validation — pure stdlib, Python 3.11+
 python3 -m unittest discover -s tests -v  # validator + Agent Skills conformance
+python3 scripts/package_kits.py check     # inventory/publication state; Python 3.12/3.13
 ```
+
+During the one-time package-v1 activation PR only, the last command is
+`python3 scripts/package_kits.py check --allow-legacy-only`; the main signing
+workflow atomically replaces that state with descriptors, package bundles, and
+`.kit-package-v1-active`. After activation, legacy-only/mixed states fail.
 
 Then run the Boundary grep below — CI's `oss-clean` job fails the build on any
 hit. CI (`.github/workflows/validate.yml`) runs both on every push and PR;
@@ -80,15 +87,27 @@ your last edit and quote each result line in your report.
 - After every manifest edit, re-run `python3 scripts/validate_kits.py` before
   claiming anything works (the manifest IS the product here).
 
-## Signing & trust (current reality — trust `sign.yml` over the READMEs)
+## Signing & trust (current reality)
 
-- Keyless Sigstore: on push to `main`, `.github/workflows/sign.yml`
-  keyless-signs every `kits/*/kit.toml` (GitHub Actions OIDC → Fulcio → Rekor,
-  `--new-bundle-format=true`) and commits the sibling `kit.toml.sigstore`
-  bundles back to `main`.
+- Keyless Sigstore: on relevant pushes to `main`, `.github/workflows/sign.yml`
+  preserves and verifies unchanged legacy `kit.toml.sigstore` bundles, signs a
+  changed manifest only after CI proves its kit version changed, generates the
+  canonical full-file `kit.package.json`, then signs/verifies that descriptor.
+- Ordering is load-bearing: `kit.toml.sigstore` is inventoried by the package,
+  so refreshing it at an unchanged kit version would create package-digest
+  equivocation. The workflow never refreshes unchanged legacy signatures.
+- The descriptor inventories exact normalized paths, SHA-256 digests, sizes,
+  and portable `0644`/`0755` modes. Its own detached
+  `kit.package.json.sigstore` is excluded, preventing self-reference.
+- The seven descriptors, their package bundles, any changed legacy bundles,
+  and `.kit-package-v1-active` are committed together only after strict local
+  validation and `cosign verify-blob` against the official identity.
 - The allowlisted signer identity is that workflow's own OIDC SAN pinned to
   `sign.yml@refs/heads/main`; the daemon's default `trust.issuerSet` trusts
   exactly that identity/issuer pair.
+- The current daemon consumes only the explicit `legacy-manifest-verified`
+  path. Complete-package consumer installation and signed catalog snapshots
+  remain separate, pending segments; do not describe them as shipped.
 - Trust modes (daemon-wide): `permissive` (verify + warn, never block),
   `signed-by-allowlist` (the DEFAULT — rejects unsigned and
   signed-but-unverified kits), `attested` (allowlist today; SLSA future).
@@ -104,6 +123,7 @@ Run this before pushing; it mirrors CI's `oss-clean` job:
 grep -rnE 'REN-[0-9]|REN2-[0-9]|SUP-[0-9]|rensei-(architecture|ops|tui|platform)|RenseiAI[/]rensei|rensei[.]ai' \
   --include='*.toml' --include='*.md' --include='*.yaml' --include='*.yml' \
   --include='*.sh' --include='*.cmd' --include='*.json' \
+  --include='*.py' \
   --exclude-dir='.git' --exclude='validate.yml' --exclude='CONTRIBUTING.md' .
 ```
 
@@ -132,8 +152,9 @@ scanned file.
 
 ## Hard stops
 
-- NEVER fabricate or hand-place a `.sigstore` bundle -> instead: merge to
-  `main` and let `sign.yml` sign it.
+- NEVER fabricate/hand-place a `.sigstore` bundle or edit `kit.package.json`
+  -> instead: change payload + bump `kit.version`, then let `sign.yml` generate
+  and sign the package on `main`.
 - NEVER rename or "de-brand" `api = "rensei.dev/v1"` -> instead: leave it; it
   is a protocol identifier, not a product name.
 - NEVER commit content that hits the Boundary grep -> instead: rewrite it
