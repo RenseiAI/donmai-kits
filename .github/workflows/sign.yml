@@ -112,11 +112,12 @@ jobs:
             kits/python/kit.toml
             kits/ruby/kit.toml
             kits/rust/kit.toml
+            kits/swift/kit.toml
             kits/ts-nextjs/kit.toml
             kits/typescript/kit.toml
           )
           if [[ "${manifests[*]}" != "${expected_manifests[*]}" ]]; then
-            echo "::error::official publication is frozen to the exact authorized seven manifests"
+            echo "::error::official publication is frozen to the exact authorized manifest set"
             exit 1
           fi
 
@@ -166,11 +167,12 @@ jobs:
             kits/python/kit.package.json
             kits/ruby/kit.package.json
             kits/rust/kit.package.json
+            kits/swift/kit.package.json
             kits/ts-nextjs/kit.package.json
             kits/typescript/kit.package.json
           )
           if [[ "${descriptors[*]}" != "${expected_descriptors[*]}" ]]; then
-            echo "::error::generator did not emit the exact authorized seven descriptors"
+            echo "::error::generator did not emit the exact authorized descriptor set"
             exit 1
           fi
 
@@ -250,7 +252,7 @@ jobs:
           python3 "${snapshot}/scripts/validate_kits.py"
           python3 "${snapshot}/scripts/package_kits.py" check
 
-          kits=(go java python ruby rust ts-nextjs typescript)
+          kits=(go java python ruby rust swift ts-nextjs typescript)
           for kit in "${kits[@]}"; do
             manifest="${snapshot}/kits/${kit}/kit.toml"
             cosign verify-blob \

@@ -33,6 +33,7 @@ from scripts.package_kits import (
     ci_check,
     discover_kit_dirs,
     ensure_unique_portable_paths,
+    first_publication_pending,
     generate_catalog,
     portable_collision_key,
     validate_descriptor,
@@ -43,6 +44,22 @@ from scripts.package_kits import (
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_KIT_IDENTITIES = {"demo": "default/demo"}
+
+
+def _published_kit_names(root: Path) -> list[str]:
+    """Kit names that have a committed legacy signature (already published).
+
+    A first-publication-pending kit (authorized, never signed) has no
+    `kit.toml.sigstore` on disk yet, so it is deliberately excluded here: it
+    carries no descriptor to inventory and never appears in a catalog snapshot
+    until it graduates.
+    """
+    return sorted(
+        kit_dir.name
+        for kit_dir in (root / "kits").iterdir()
+        if (kit_dir / "kit.toml").is_file()
+        and (kit_dir / "kit.toml.sigstore").is_file()
+    )
 
 
 def _fixture_bundle(subject: bytes) -> bytes:
@@ -92,6 +109,46 @@ def _publish(root: Path, kit_dir: Path) -> None:
     descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
     (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(descriptor))
     (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+
+
+def _write_pending_kit(root: Path, name: str) -> Path:
+    """Write a first-publication-pending kit: kit.toml + payload, no sigstore.
+
+    Unlike `_write_kit`, this writes no `kit.toml.sigstore` — the kit is
+    authorized but never signed, exactly the on-disk shape the main-only signer
+    graduates on merge.
+    """
+    kit_dir = root / "kits" / name
+    (kit_dir / "bin").mkdir(parents=True)
+    (kit_dir / "data").mkdir()
+    manifest = kit_dir / "kit.toml"
+    manifest.write_text(
+        'api = "rensei.dev/v1"\n'
+        "[kit]\n"
+        f'id = "default/{name}"\n'
+        'version = "1.0.0"\n'
+        f'name = "{name}"\n'
+        'authorIdentity = "did:web:donmai.dev"\n',
+        encoding="utf-8",
+    )
+    setup = kit_dir / "bin" / "setup.sh"
+    setup.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    setup.chmod(0o755)
+    (kit_dir / "data" / "notes.txt").write_text("pending\n", encoding="utf-8")
+    return kit_dir
+
+
+def _publish_single(root: Path, kit_dir: Path) -> None:
+    """Publish one already-legacy-signed kit: mint its descriptor + signature.
+
+    Unlike `_publish`, this touches only `kit_dir` (it does not run
+    `generate_catalog`, which would require every discovered kit to already
+    carry a legacy signature) — so a sibling kit can stay
+    first-publication-pending.
+    """
+    _, descriptor = build_descriptor(root, kit_dir)
+    (kit_dir / DESCRIPTOR_NAME).write_bytes(descriptor)
+    (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(descriptor))
 
 
 def _generate_catalog(root: Path):
@@ -153,11 +210,15 @@ def _commit_changes(root: Path, message: str = "candidate") -> None:
 
 
 class CurrentCatalogPackageTests(unittest.TestCase):
-    def test_official_catalog_is_exactly_the_authorized_seven(self) -> None:
+    def test_official_catalog_is_exactly_the_authorized_eight(self) -> None:
         kit_dirs = discover_kit_dirs(ROOT)
+        # Data-driven off EXPECTED_KIT_IDENTITIES: the on-disk directories must
+        # be exactly the authorized set (eight after the swift expansion).
         self.assertEqual(
             sorted(EXPECTED_KIT_IDENTITIES), [path.name for path in kit_dirs]
         )
+        self.assertEqual(8, len(kit_dirs))
+        self.assertIn("swift", [path.name for path in kit_dirs])
 
     def test_official_catalog_add_delete_and_id_substitution_fail(self) -> None:
         def copied_catalog() -> tuple[tempfile.TemporaryDirectory, Path]:
@@ -169,13 +230,13 @@ class CurrentCatalogPackageTests(unittest.TestCase):
         temporary, root = copied_catalog()
         with temporary:
             shutil.copytree(root / "kits" / "go", root / "kits" / "extra")
-            with self.assertRaisesRegex(PackageError, "authorized seven-kit set"):
+            with self.assertRaisesRegex(PackageError, "authorized kit set"):
                 discover_kit_dirs(root)
 
         temporary, root = copied_catalog()
         with temporary:
             shutil.rmtree(root / "kits" / "java")
-            with self.assertRaisesRegex(PackageError, "authorized seven-kit set"):
+            with self.assertRaisesRegex(PackageError, "authorized kit set"):
                 discover_kit_dirs(root)
 
         temporary, root = copied_catalog()
@@ -196,34 +257,38 @@ class CurrentCatalogPackageTests(unittest.TestCase):
                 with self.assertRaises(PackageError):
                     canonical_json_bytes({"value": value})
 
-    def test_current_catalog_renders_seven_package_candidates(self) -> None:
+    def test_current_catalog_renders_published_package_candidates(self) -> None:
+        published = _published_kit_names(ROOT)
         generated = [
             (
-                manifest.parent.name,
+                name,
                 hashlib.sha256(
                     build_descriptor(
                         ROOT,
-                        manifest.parent,
+                        ROOT / "kits" / name,
                         require_legacy_subject_match=False,
                     )[1]
                 ).hexdigest(),
             )
-            for manifest in sorted((ROOT / "kits").glob("*/kit.toml"))
+            for name in published
         ]
 
-        self.assertEqual(7, len(generated))
-        self.assertEqual(
-            ["go", "java", "python", "ruby", "rust", "ts-nextjs", "typescript"],
-            [name for name, _ in generated],
+        # Data-driven off the published subset (kits with a committed legacy
+        # signature). A first-publication-pending kit has no descriptor to
+        # render, so it is excluded until it graduates.
+        self.assertEqual(published, [name for name, _ in generated])
+        self.assertTrue(published)
+        self.assertTrue(
+            set(published).issubset(set(EXPECTED_KIT_IDENTITIES))
         )
         self.assertTrue(all(len(digest) == 64 for _, digest in generated))
 
     def test_current_descriptor_inventory_is_complete_and_sorted(self) -> None:
-        for manifest in sorted((ROOT / "kits").glob("*/kit.toml")):
-            with self.subTest(kit=manifest.parent.name):
+        for name in _published_kit_names(ROOT):
+            with self.subTest(kit=name):
                 descriptor, raw = build_descriptor(
                     ROOT,
-                    manifest.parent,
+                    ROOT / "kits" / name,
                     require_legacy_subject_match=False,
                 )
                 paths = [entry["path"] for entry in descriptor["entries"]]
@@ -238,20 +303,20 @@ class CurrentCatalogPackageTests(unittest.TestCase):
 
     def test_current_generation_is_byte_reproducible(self) -> None:
         first = {
-            manifest.parent.name: build_descriptor(
+            name: build_descriptor(
                 ROOT,
-                manifest.parent,
+                ROOT / "kits" / name,
                 require_legacy_subject_match=False,
             )[1]
-            for manifest in sorted((ROOT / "kits").glob("*/kit.toml"))
+            for name in _published_kit_names(ROOT)
         }
         second = {
-            manifest.parent.name: build_descriptor(
+            name: build_descriptor(
                 ROOT,
-                manifest.parent,
+                ROOT / "kits" / name,
                 require_legacy_subject_match=False,
             )[1]
-            for manifest in sorted((ROOT / "kits").glob("*/kit.toml"))
+            for name in _published_kit_names(ROOT)
         }
         self.assertEqual(first, second)
 
@@ -299,13 +364,13 @@ class CatalogCandidateTests(unittest.TestCase):
 
     def test_discovery_order_does_not_affect_candidate(self) -> None:
         locators = [
-            f"kits/{name}/{DESCRIPTOR_NAME}" for name in EXPECTED_KIT_IDENTITIES
+            f"kits/{name}/{DESCRIPTOR_NAME}" for name in _published_kit_names(ROOT)
         ]
         forward = self._build(descriptor_locators=locators)
         reverse = self._build(descriptor_locators=reversed(locators))
         self.assertEqual(forward, reverse)
 
-    def test_exact_seven_rows_agree_with_published_descriptors(self) -> None:
+    def test_rows_agree_with_published_descriptors(self) -> None:
         raw, _ = self._build()
         candidate = json.loads(raw)
         signing_workflow = (ROOT / ".github" / "workflows" / "sign.yml").read_text(
@@ -323,9 +388,12 @@ class CatalogCandidateTests(unittest.TestCase):
         self.assertEqual("unsigned-candidate", candidate["state"])
         self.assertEqual(self.REVISION, candidate["sourceRevision"])
         self.assertEqual(1, candidate["sequence"])
-        self.assertEqual(7, len(candidate["packages"]))
 
-        expected_ids = sorted(EXPECTED_KIT_IDENTITIES.values())
+        # The snapshot covers exactly the published subset; a
+        # first-publication-pending kit contributes no signed descriptor row.
+        published = _published_kit_names(ROOT)
+        self.assertEqual(len(published), len(candidate["packages"]))
+        expected_ids = sorted(EXPECTED_KIT_IDENTITIES[name] for name in published)
         self.assertEqual(
             expected_ids, [row["kit"]["id"] for row in candidate["packages"]]
         )
@@ -947,6 +1015,75 @@ class CandidateStateTests(unittest.TestCase):
                     base,
                     ["kits/demo/kit.toml", "kits/renamed/kit.toml"],
                 )
+
+
+class FirstPublicationTests(unittest.TestCase):
+    """The first-publication-pending state: a new authorized kit graduates
+    through an explicit signer path, never silently, and never opens a
+    demotion hole for an already-published kit."""
+
+    TWO = {"demo": "default/demo", "beta": "default/beta"}
+
+    def test_new_kit_is_first_publication_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # demo is fully published; the marker is active.
+            demo = _write_kit(root, "demo")
+            _publish_single(root, demo)
+            (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+            base = _commit_fixture(root)
+
+            # beta enters as first-publication-pending: kit.toml + payload only.
+            beta = _write_pending_kit(root, "beta")
+            _commit_changes(root, "add beta (first-publication-pending)")
+
+            kit_dirs = discover_kit_dirs(root, expected_identities=self.TWO)
+            self.assertEqual(["beta", "demo"], sorted(k.name for k in kit_dirs))
+            self.assertEqual({"beta"}, first_publication_pending(root, kit_dirs))
+
+            # check (active): demo stays fully verified; beta is pending.
+            state, generated = check_catalog(root, expected_identities=self.TWO)
+            self.assertEqual("published", state)
+            self.assertEqual(["demo"], [name for name, _ in generated])
+
+            # ci-check: beta is a first-publication candidate → signing-pending.
+            ci_state, ci_generated = ci_check(
+                root, base, expected_identities=self.TWO
+            )
+            self.assertEqual("signing-pending", ci_state)
+            self.assertEqual({"beta", "demo"}, {name for name, _ in ci_generated})
+
+            # The signer mints all three artifacts on merge; beta graduates.
+            beta_manifest = (beta / "kit.toml").read_bytes()
+            (beta / "kit.toml.sigstore").write_bytes(_fixture_bundle(beta_manifest))
+            _publish_single(root, beta)
+
+            self.assertEqual(set(), first_publication_pending(root, kit_dirs))
+            graduated, gen = check_catalog(root, expected_identities=self.TWO)
+            self.assertEqual("published", graduated)
+            self.assertEqual(["beta", "demo"], sorted(name for name, _ in gen))
+
+    def test_pending_kit_with_descriptor_but_no_sigstore_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            demo = _write_kit(root, "demo")
+            _publish_single(root, demo)
+            (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+
+            # beta carries a descriptor but no legacy signature — the exact
+            # shape of deleting a published kit's sigstore to swap its payload.
+            beta = _write_pending_kit(root, "beta")
+            _, beta_descriptor = build_descriptor(
+                root, beta, require_legacy_signature=False
+            )
+            (beta / DESCRIPTOR_NAME).write_bytes(beta_descriptor)
+
+            kit_dirs = discover_kit_dirs(root, expected_identities=self.TWO)
+            with self.assertRaisesRegex(PackageError, "without a legacy signature"):
+                first_publication_pending(root, kit_dirs)
+            # The demotion-hole guard also fails the whole active check closed.
+            with self.assertRaisesRegex(PackageError, "without a legacy signature"):
+                check_catalog(root, expected_identities=self.TWO)
 
 
 if __name__ == "__main__":

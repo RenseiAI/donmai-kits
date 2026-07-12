@@ -4,20 +4,33 @@
 The package contract is defined by the accepted architecture ADR:
 `ADR-2026-07-10-deterministic-kit-packages-and-command-composition.md`.
 
-This publisher-side tool deliberately separates three states:
+This publisher-side tool deliberately separates these states:
 
 * legacy-only bootstrap: every manifest has its historic manifest signature,
   and no package descriptor exists;
+* first-publication-pending: an authorized kit that has never been signed. It
+  carries only kit.toml plus payload — no legacy signature, no descriptor, no
+  descriptor signature. Its payload/path closure and identity are validated,
+  but it requires no descriptor to exist; the main-only signer mints the legacy
+  signature, the descriptor, and the descriptor signature on merge, graduating
+  it to published. A kit missing its legacy signature while still carrying a
+  descriptor or descriptor signature is a demotion-hole attempt and is rejected;
 * signing-pending candidate: the new payload produces a deterministic
   descriptor in memory while the on-disk descriptor/signature remain the
   previous self-consistent publication until the main-only signer runs; and
 * published: every descriptor and both detached signature bundles are present,
   structurally bind their exact subjects, and the activation marker exists.
 
-Only the signing workflow may move the repository from legacy-only to
-published. The workflow additionally performs full Sigstore trust verification;
-this pure-stdlib tool verifies bundle shape and subject digest so local/PR drift
-checks remain hermetic.
+Only the signing workflow may move a kit from legacy-only or
+first-publication-pending to published. The workflow additionally performs full
+Sigstore trust verification; this pure-stdlib tool verifies bundle shape and
+subject digest so local/PR drift checks remain hermetic.
+
+The authorized-set expansion procedure — how a new directory enters
+EXPECTED_KIT_IDENTITIES through an explicit, reviewed first-publication path
+rather than silently — is defined by
+`ADR-2026-07-12-kit-catalog-expansion.md`, which amends the deterministic
+package contract in `ADR-2026-07-10-...`.
 """
 
 from __future__ import annotations
@@ -62,6 +75,7 @@ EXPECTED_KIT_IDENTITIES = {
     "python": "default/python",
     "ruby": "default/ruby",
     "rust": "default/rust",
+    "swift": "default/swift",
     "ts-nextjs": "default/ts-nextjs",
     "typescript": "default/typescript",
 }
@@ -726,29 +740,47 @@ def build_descriptor(
     kit_dir: Path,
     *,
     require_legacy_subject_match: bool = True,
+    require_legacy_signature: bool = True,
 ) -> tuple[dict[str, Any], bytes]:
+    """Build the canonical descriptor for one kit directory.
+
+    A published or signing-pending kit carries `kit.toml.sigstore`, which is
+    itself inventoried; `require_legacy_signature=True` (the default) validates
+    and inventories it. A first-publication-pending kit has never been signed,
+    so it carries no legacy bundle yet; passing `require_legacy_signature=False`
+    validates only the manifest + payload closure and asserts the legacy bundle
+    is genuinely absent from the inventory. The main-only signer mints the
+    legacy bundle before it generates the on-disk descriptor, so the published
+    descriptor always inventories it.
+    """
     manifest_path = kit_dir / MANIFEST_NAME
-    legacy_signature = kit_dir / LEGACY_SIGNATURE_NAME
     manifest_bytes, _ = _read_regular_file(root, manifest_path)
-    legacy_signature_bytes = validate_sigstore_bundle(
-        root,
-        legacy_signature,
-        manifest_bytes,
-        require_subject_match=require_legacy_subject_match,
-    )
+    required_payload: list[tuple[str, bytes]] = [(MANIFEST_NAME, manifest_bytes)]
+    if require_legacy_signature:
+        legacy_signature = kit_dir / LEGACY_SIGNATURE_NAME
+        legacy_signature_bytes = validate_sigstore_bundle(
+            root,
+            legacy_signature,
+            manifest_bytes,
+            require_subject_match=require_legacy_subject_match,
+        )
+        required_payload.append((LEGACY_SIGNATURE_NAME, legacy_signature_bytes))
     kit_id, version, publisher = _manifest_identity(manifest_bytes, str(manifest_path))
     entries = _walk_payload(root, kit_dir)
     entry_by_path = {entry["path"]: entry for entry in entries}
-    for path, data in (
-        (MANIFEST_NAME, manifest_bytes),
-        (LEGACY_SIGNATURE_NAME, legacy_signature_bytes),
-    ):
+    for path, data in required_payload:
         entry = entry_by_path.get(path)
         _require(entry is not None, f"payload inventory is missing required {path}")
         _require(
             entry["size"] == len(data)
             and entry["sha256"] == hashlib.sha256(data).hexdigest(),
             f"{path} changed between trust validation and payload inventory",
+        )
+    if not require_legacy_signature:
+        _require(
+            LEGACY_SIGNATURE_NAME not in entry_by_path,
+            f"kits/{kit_dir.name} first-publication payload must not include "
+            f"{LEGACY_SIGNATURE_NAME} before the signer mints it",
         )
     descriptor = {
         "schema": PACKAGE_SCHEMA,
@@ -878,7 +910,7 @@ def discover_kit_dirs(
     expected_names = set(expected_identities)
     _require(
         actual_names == expected_names,
-        "official package publication is frozen to the authorized seven-kit set; "
+        "official package publication is frozen to the authorized kit set; "
         f"missing={sorted(expected_names - actual_names)}, "
         f"extra={sorted(actual_names - expected_names)}",
     )
@@ -900,6 +932,50 @@ def _package_artifacts(root: Path) -> list[Path]:
         for path in (root / "kits").rglob("kit.package.json*")
         if path.name in PACKAGE_METADATA_NAMES
     )
+
+
+def _kit_file_present(root: Path, kit_dir: Path, name: str) -> bool:
+    """Report whether kits/<kit>/<name> exists, without following any link."""
+    kit_parts = _relative_parts(root, kit_dir)
+    with _open_relative_directory(root, kit_parts) as kit_fd:
+        try:
+            os.stat(name, dir_fd=kit_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PackageError(
+                f"cannot stat kits/{kit_dir.name}/{name}: {exc}"
+            ) from exc
+        return True
+
+
+def first_publication_pending(root: Path, kit_dirs: Iterable[Path]) -> set[str]:
+    """Return the authorized kits that have never been signed.
+
+    A kit is *first-publication-pending* iff it is authorized (present in
+    `discover_kit_dirs`) and carries no `kit.toml.sigstore` on disk. During that
+    window it holds only `kit.toml` plus payload — and, as an invariant, none of
+    the three trust artifacts. Because the descriptor inventories the legacy
+    bundle, a kit that carries a descriptor or descriptor signature but no legacy
+    signature can only be an attempt to delete a published kit's legacy bundle
+    and swap its payload; it is rejected here (the demotion-hole guard) rather
+    than silently treated as pending. On merge the signer mints all three
+    artifacts and the kit graduates to published.
+    """
+    pending: set[str] = set()
+    for kit_dir in kit_dirs:
+        if _kit_file_present(root, kit_dir, LEGACY_SIGNATURE_NAME):
+            continue
+        for name in (DESCRIPTOR_NAME, DESCRIPTOR_SIGNATURE_NAME):
+            _require(
+                not _kit_file_present(root, kit_dir, name),
+                f"kits/{kit_dir.name} carries {name} without a legacy signature; "
+                "a first-publication-pending kit must hold none of "
+                f"{{{LEGACY_SIGNATURE_NAME}, {DESCRIPTOR_NAME}, "
+                f"{DESCRIPTOR_SIGNATURE_NAME}}}",
+            )
+        pending.add(kit_dir.name)
+    return pending
 
 
 def check_catalog(
@@ -932,18 +1008,23 @@ def check_catalog(
         marker_bytes == PACKAGE_MARKER_BYTES,
         "package activation marker bytes are invalid",
     )
+    pending = first_publication_pending(root, kit_dirs)
+    published = [kit_dir for kit_dir in kit_dirs if kit_dir.name not in pending]
     expected_artifacts = {
         kit_dir / name
-        for kit_dir in kit_dirs
+        for kit_dir in published
         for name in (DESCRIPTOR_NAME, DESCRIPTOR_SIGNATURE_NAME)
     }
+    # A first-publication-pending kit contributes zero artifacts (asserted by
+    # first_publication_pending), so the published subset accounts for every
+    # descriptor artifact on disk. The published subset stays fully verified.
     _require(
         set(artifacts) == expected_artifacts,
         "active package state has missing, extra, or misplaced descriptor artifacts",
     )
 
     generated = []
-    for kit_dir in kit_dirs:
+    for kit_dir in published:
         descriptor_bytes = validate_descriptor(root, kit_dir)
         generated.append((kit_dir.name, hashlib.sha256(descriptor_bytes).hexdigest()))
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
@@ -998,20 +1079,26 @@ def build_catalog_snapshot_candidate(
     state, _ = check_catalog(root, expected_identities=EXPECTED_KIT_IDENTITIES)
     _require(state == "published", "catalog candidate requires published packages")
 
+    # Only the published subset carries signed descriptors. A
+    # first-publication-pending kit has none yet, so it never appears in a
+    # catalog snapshot until it graduates to published.
+    kit_dirs = discover_kit_dirs(root, expected_identities=EXPECTED_KIT_IDENTITIES)
+    pending = first_publication_pending(root, kit_dirs)
+    published_names = sorted(
+        name for name in EXPECTED_KIT_IDENTITIES if name not in pending
+    )
+
     if descriptor_locators is None:
-        locators = [
-            f"kits/{name}/{DESCRIPTOR_NAME}"
-            for name in sorted(EXPECTED_KIT_IDENTITIES)
-        ]
+        locators = [f"kits/{name}/{DESCRIPTOR_NAME}" for name in published_names]
     else:
         locators = list(descriptor_locators)
     _require(
-        len(locators) == len(EXPECTED_KIT_IDENTITIES),
-        "catalog candidate must consume exactly the authorized descriptor count",
+        len(locators) == len(published_names),
+        "catalog candidate must consume exactly the published descriptor count",
     )
 
     expected_locators = {
-        f"kits/{name}/{DESCRIPTOR_NAME}" for name in EXPECTED_KIT_IDENTITIES
+        f"kits/{name}/{DESCRIPTOR_NAME}" for name in published_names
     }
     seen_locators: set[str] = set()
     rows: list[dict[str, Any]] = []
@@ -1096,28 +1183,41 @@ def build_catalog_snapshot_candidate(
 
 def check_signing_candidate(
     root: Path,
-    pending_kits: set[str],
+    changed_kits: set[str],
     *,
     expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Validate a pre-sign candidate without treating it as published.
 
-    Generated descriptors/signatures remain the previously published pair in a
-    human PR. For a kit whose payload changed, we validate that pair against
-    itself (so corruption is still rejected), validate the new payload/path
-    closure in memory, and require a version bump separately. The main-only
-    signer then refreshes the legacy signature, generates the final descriptor,
-    signs it, and runs the strict published check before committing.
+    Three shapes of kit are accepted in one candidate:
+
+    * A **first-publication-pending** kit (authorized, never signed) carries no
+      descriptor yet. We validate only its payload/path closure and identity in
+      memory; no descriptor is required. Its historical-identity reuse is
+      enforced by the caller's version-bump gate.
+    * A **changed already-published** kit keeps its previously published
+      descriptor/signature pair in the human PR. We validate that pair against
+      itself (so corruption is still rejected) and validate the new payload/path
+      closure in memory; a version bump is required separately.
+    * An **unchanged published** kit is validated exactly as published.
+
+    The main-only signer then mints/refreshes the legacy signature, generates
+    the final descriptor, signs it, and runs the strict published check before
+    committing.
     """
     kit_dirs = discover_kit_dirs(root, expected_identities=expected_identities)
     _require(
         _read_optional_root_file(root, PACKAGE_MARKER) == PACKAGE_MARKER_BYTES,
         "signing candidate requires the active package-v1 marker",
     )
+    first_publication = first_publication_pending(root, kit_dirs)
+    published_dirs = [
+        kit_dir for kit_dir in kit_dirs if kit_dir.name not in first_publication
+    ]
     artifacts = _package_artifacts(root)
     expected_artifacts = {
         kit_dir / name
-        for kit_dir in kit_dirs
+        for kit_dir in published_dirs
         for name in (DESCRIPTOR_NAME, DESCRIPTOR_SIGNATURE_NAME)
     }
     _require(
@@ -1126,14 +1226,27 @@ def check_signing_candidate(
     )
     known_kits = {kit_dir.name for kit_dir in kit_dirs}
     _require(
-        pending_kits <= known_kits,
-        f"signing candidate references unknown kits: {sorted(pending_kits - known_kits)}",
+        changed_kits <= known_kits,
+        f"signing candidate references unknown kits: {sorted(changed_kits - known_kits)}",
     )
 
     generated: list[tuple[str, str]] = []
     for kit_dir in kit_dirs:
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
-        if kit_dir.name not in pending_kits:
+        if kit_dir.name in first_publication:
+            # First publication: no descriptor exists yet. Validate the payload
+            # and identity closure in memory only; the main-only signer mints
+            # the legacy signature, descriptor, and descriptor signature.
+            _, candidate_descriptor = build_descriptor(
+                root,
+                kit_dir,
+                require_legacy_signature=False,
+            )
+            generated.append(
+                (kit_dir.name, hashlib.sha256(candidate_descriptor).hexdigest())
+            )
+            continue
+        if kit_dir.name not in changed_kits:
             descriptor_bytes = validate_descriptor(root, kit_dir)
             validate_sigstore_bundle(root, signature_path, descriptor_bytes)
             generated.append(
@@ -1420,16 +1533,16 @@ def ci_check(
             expected_identities=expected_identities,
         )
 
-    pending_kits = {
+    changed_kits = {
         path.split("/")[1]
         for path in paths
         if path.startswith("kits/")
         and len(path.split("/")) >= 3
         and path.split("/")[-1] not in generated_names
     }
-    if pending_kits:
+    if changed_kits:
         return check_signing_candidate(
-            root, pending_kits, expected_identities=expected_identities
+            root, changed_kits, expected_identities=expected_identities
         )
     return check_catalog(root, expected_identities=expected_identities)
 

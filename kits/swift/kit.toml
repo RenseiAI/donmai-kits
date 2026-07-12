@@ -1,0 +1,126 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Swift foundation kit (mobile foundation).
+#
+# SCOPE (load-bearing): this kit builds/tests **Swift logic modules** with
+# Swift Package Manager. On the Linux cloud lane it compiles only pure-Swift
+# targets — iOS/macOS app targets that import UIKit / SwiftUI / SwiftData /
+# ActivityKit DO NOT build on Linux. iOS app build, UI test, and screenshot
+# capture are a **macOS-pool-only** lane (see [provide.commands_override.macos]
+# and the macOS capacity-host note). Structure Package.swift so Apple-only
+# targets are excluded from the default Linux build.
+#
+# COMPOSITION: this is the single Swift *foundation* kit (detects Package.swift).
+# A future "mobile"/"ios" *framework* kit must compose on top with
+# order = "framework" on a DISJOINT detect file — never a second foundation.
+#
+# PATH-MUTATING INSTALLER: swiftly (Apple's official toolchain manager) writes an
+# env file (~/.local/share/swiftly/env.sh on Linux). Until demand.env is wired
+# end-to-end (see the rust kit header), the install script AND the post_acquire
+# hook BOTH source that env so `swift` resolves for the next command.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/swift"
+version = "1.0.0"
+name = "Swift"
+description = "OSS default foundation kit for Swift Package Manager projects. Detects Package.swift and provides a pinned Swift 6 toolchain (via swiftly), build/test/format commands, and Swift conventions. Scope: Swift logic modules build/test on Linux; iOS/macOS app build, UI test, and screenshot are macOS-pool only."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+# Windows is intentionally omitted — the Swift-on-Windows story is weaker and
+# untested here; declare only what this kit ships (spec: kits SHOULD NOT
+# silently no-op on unsupported platforms).
+os = ["linux", "macos"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — any Swift Package Manager project.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["Package.swift"]
+
+# Pre-declare the toolchain pin so the workarea/sandbox can pre-warm Swift 6.
+[detect.toolchain]
+swift = "6.0"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+# `validate` lints the canonical SPM source dir. `swift format` is the
+# in-toolchain formatter/linter (invoked as the `format` subcommand). Projects
+# that also want Tests/ linted extend this via a local `.kit.toml` override.
+[provide.commands]
+build    = "swift build"
+test     = "swift test"
+validate = "swift format lint --strict --recursive Sources"
+
+[[provide.tool_permissions]]
+shell = "swift *"
+
+[[provide.tool_permissions]]
+shell = "swiftly *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "swift-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/swift-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/swift-testing/SKILL.md"
+id   = "swift-testing"
+
+[provide.workarea_config]
+clean_dirs    = [".build", "DerivedData"]
+# Preserve the SwiftPM caches + resolved pins so dependency builds aren't redone.
+preserve_dirs = ["~/.swiftpm", "~/.cache/org.swift.swiftpm"]
+
+# Per-OS toolchain install. Cloud sandboxes are Linux → .linux is load-bearing.
+# The swiftly tarball URL branches on $(uname -m) → x86_64 | aarch64 (a
+# hardcoded arch URL breaks arm64 cloud images). The install sources swiftly's
+# env file so `swift` is on PATH for the same shell.
+[provide.toolchain_install.linux]
+swift_6 = "curl -fsSL https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz -o /tmp/swiftly.tgz && tar -xzf /tmp/swiftly.tgz -C /tmp && /tmp/swiftly init --assume-yes --skip-install --no-modify-profile && . \"$HOME/.local/share/swiftly/env.sh\" && swiftly install 6.0.3 && swiftly use 6.0.3"
+
+# macOS parity (local-dev / Mac capacity pool — not load-bearing). Swift also
+# ships inside Xcode; swiftly manages pinned extra toolchains. The macOS host is
+# where the iOS app build/test/screenshot lane runs (see commands_override).
+[provide.toolchain_install.macos]
+swift_6 = "curl -fsSL https://download.swift.org/swiftly/darwin/swiftly.pkg -o /tmp/swiftly.pkg && installer -pkg /tmp/swiftly.pkg -target CurrentUserHomeDirectory && . \"$HOME/.swiftly/env.sh\" && swiftly install 6.0.3 && swiftly use 6.0.3"
+
+# macOS-only command overlay. Documented for the macOS capacity pool; these
+# never run on the Linux cloud lane (UIKit/SwiftUI do not build on Linux). The
+# base commands above stay Linux-valid for logic modules. An iOS app project on
+# a macOS host drives xcodegen/xcodebuild/simctl through its own Makefile/CI —
+# this kit's generic aliases stay SPM-level so a logic-only package still works.
+[provide.commands_override.macos]
+build    = "swift build"
+test     = "swift test"
+validate = "swift format lint --strict --recursive Sources"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]
