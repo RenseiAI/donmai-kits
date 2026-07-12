@@ -1,0 +1,45 @@
+# Swift conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: swift-conventions
+content: |
+  ## Swift Project Context
+
+  This project uses Swift 6 with Swift Package Manager. Follow these conventions:
+
+  ### Build & Test
+  - `swift build` — build every target
+  - `swift test` — run the test suite
+  - `swift format lint --strict --recursive Sources` — lint gate (validate)
+  - `swift format format -i --recursive Sources` — apply formatting before committing
+
+  ### Concurrency (Swift 6 strict mode)
+  - Strict concurrency checking is on; data races are compile errors, not
+    runtime bugs — read the isolation the compiler names and fix it there
+  - `MainActor` is the default isolation for app/UI code — most view models
+    and UI-adjacent types are implicitly main-actor
+  - Mark background/CPU work `nonisolated` (or `@concurrent` where available)
+    rather than fighting the default isolation
+  - `@Model` / `ModelContext` (SwiftData) are NOT `Sendable` — never pass them
+    across actors directly; hand off a `PersistentIdentifier` and re-fetch on
+    the receiving actor instead
+
+  ### Testing
+  - Prefer Swift Testing (`@Test`, `#expect`, `#require`) for new unit tests
+  - Put testable logic in plain SPM modules (no UIKit/SwiftUI import) so it
+    also runs on the Linux CI lane
+  - XCTest/XCUITest remain for UI flows and performance tests (`measure`) —
+    both are Apple-platform only
+  - Use swift-snapshot-testing for view regression; pin the recording
+    simulator OS/device so comparisons stay stable
+
+  ### Error Handling
+  - Prefer typed `throws` / `Result<T, E>` over force-unwrap or force-try
+  - Never force-unwrap (`!`) or force-try (`try!`) in non-test code
+
+  ### Linux / macOS Split
+  - UIKit, SwiftUI, SwiftData, and ActivityKit do NOT build on Linux — guard
+    Apple-only code with `#if canImport(UIKit)` (or the relevant framework)
+    so the Linux build only compiles pure-Swift logic modules
+  - iOS app build, UI test (XCUITest), and screenshot capture are a
+    macOS-only lane; the Linux cloud lane covers logic-module build/test only
