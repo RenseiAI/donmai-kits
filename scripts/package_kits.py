@@ -56,6 +56,12 @@ from typing import Any, Iterable, Iterator, Mapping
 
 PACKAGE_SCHEMA = "donmai.dev/kit-package/v1"
 CATALOG_CANDIDATE_SCHEMA = "donmai.dev/kit-catalog-candidate/v1"
+CATALOG_SCHEMA = "donmai.dev/kit-catalog/v1"
+CATALOG_DIR = "catalog"
+CATALOG_NAME = "kit-catalog.json"
+CATALOG_SIGNATURE_NAME = "kit-catalog.json.sigstore"
+CATALOG_PATH = f"{CATALOG_DIR}/{CATALOG_NAME}"
+CATALOG_SIGNATURE_PATH = f"{CATALOG_DIR}/{CATALOG_SIGNATURE_NAME}"
 PACKAGE_MARKER = ".kit-package-v1-active"
 PACKAGE_MARKER_BYTES = b'{"schema":"donmai.dev/kit-package/v1","state":"active"}'
 MANIFEST_NAME = "kit.toml"
@@ -1058,6 +1064,7 @@ def build_catalog_snapshot_candidate(
     source_revision: str,
     sequence: int,
     descriptor_locators: Iterable[str] | None = None,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[bytes, str]:
     """Return an unsigned canonical catalog candidate and its SHA-256 digest.
 
@@ -1076,16 +1083,16 @@ def build_catalog_snapshot_candidate(
         and 1 <= sequence <= MAX_SAFE_INTEGER,
         "catalog sequence must be a positive interoperable integer",
     )
-    state, _ = check_catalog(root, expected_identities=EXPECTED_KIT_IDENTITIES)
+    state, _ = check_catalog(root, expected_identities=expected_identities)
     _require(state == "published", "catalog candidate requires published packages")
 
     # Only the published subset carries signed descriptors. A
     # first-publication-pending kit has none yet, so it never appears in a
     # catalog snapshot until it graduates to published.
-    kit_dirs = discover_kit_dirs(root, expected_identities=EXPECTED_KIT_IDENTITIES)
+    kit_dirs = discover_kit_dirs(root, expected_identities=expected_identities)
     pending = first_publication_pending(root, kit_dirs)
     published_names = sorted(
-        name for name in EXPECTED_KIT_IDENTITIES if name not in pending
+        name for name in expected_identities if name not in pending
     )
 
     if descriptor_locators is None:
@@ -1179,6 +1186,122 @@ def build_catalog_snapshot_candidate(
     }
     canonical = canonical_json_bytes(candidate)
     return canonical, hashlib.sha256(canonical).hexdigest()
+
+
+def build_catalog_snapshot(
+    root: Path,
+    *,
+    source_revision: str,
+    sequence: int,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> tuple[bytes, str]:
+    """Return the canonical pinned catalog subject that the signer publishes."""
+    candidate_raw, _ = build_catalog_snapshot_candidate(
+        root,
+        source_revision=source_revision,
+        sequence=sequence,
+        expected_identities=expected_identities,
+    )
+    candidate = strict_json_loads(candidate_raw, "catalog candidate")
+    snapshot = {
+        "schema": CATALOG_SCHEMA,
+        "sourceRevision": candidate["sourceRevision"],
+        "sequence": candidate["sequence"],
+        "packages": candidate["packages"],
+    }
+    canonical = canonical_json_bytes(snapshot)
+    return canonical, hashlib.sha256(canonical).hexdigest()
+
+
+def _catalog_artifact_presence(root: Path) -> tuple[bool, bool]:
+    return (
+        os.path.lexists(root / CATALOG_PATH),
+        os.path.lexists(root / CATALOG_SIGNATURE_PATH),
+    )
+
+
+def validate_catalog_snapshot(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> tuple[int, int, str]:
+    """Validate the exact pinned snapshot and detached Sigstore subject."""
+    snapshot_present, signature_present = _catalog_artifact_presence(root)
+    _require(
+        snapshot_present and signature_present,
+        "pinned catalog requires both the canonical snapshot and detached signature",
+    )
+    raw, _ = _read_regular_file(root, root / CATALOG_PATH)
+    value = strict_json_loads(raw, CATALOG_PATH)
+    _require(isinstance(value, dict), f"{CATALOG_PATH} must be a JSON object")
+    _require(
+        set(value) == {"schema", "sourceRevision", "sequence", "packages"},
+        f"{CATALOG_PATH} has missing or unknown top-level fields",
+    )
+    _require(value.get("schema") == CATALOG_SCHEMA, "pinned catalog schema mismatch")
+    _require(raw == canonical_json_bytes(value), f"{CATALOG_PATH} is not canonical")
+    expected, digest = build_catalog_snapshot(
+        root,
+        source_revision=value.get("sourceRevision"),
+        sequence=value.get("sequence"),
+        expected_identities=expected_identities,
+    )
+    _require(
+        raw == expected,
+        "pinned catalog does not exactly inventory the current published packages",
+    )
+    validate_sigstore_bundle(root, root / CATALOG_SIGNATURE_PATH, raw)
+    return value["sequence"], len(value["packages"]), digest
+
+
+def next_catalog_sequence(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> int:
+    """Return one after the current validated sequence, or one for bootstrap."""
+    snapshot_present, signature_present = _catalog_artifact_presence(root)
+    _require(
+        snapshot_present == signature_present,
+        "pinned catalog snapshot and detached signature must appear together",
+    )
+    if not snapshot_present:
+        return 1
+    sequence, _, _ = validate_catalog_snapshot(
+        root, expected_identities=expected_identities
+    )
+    _require(sequence < MAX_SAFE_INTEGER, "pinned catalog sequence is exhausted")
+    return sequence + 1
+
+
+def generate_catalog_snapshot(
+    root: Path,
+    *,
+    source_revision: str,
+    sequence: int,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> tuple[int, str]:
+    """Atomically write a canonical catalog subject for main-only signing."""
+    raw, digest = build_catalog_snapshot(
+        root,
+        source_revision=source_revision,
+        sequence=sequence,
+        expected_identities=expected_identities,
+    )
+    catalog_dir = root / CATALOG_DIR
+    catalog_dir.mkdir(mode=0o755, exist_ok=True)
+    _require(
+        catalog_dir.is_dir() and not catalog_dir.is_symlink(),
+        f"{CATALOG_DIR} must be an ordinary directory",
+    )
+    with tempfile.NamedTemporaryFile(
+        dir=catalog_dir, prefix=".tmp-catalog-", delete=False
+    ) as handle:
+        temp_path = Path(handle.name)
+        handle.write(raw)
+    os.chmod(temp_path, 0o644)
+    os.replace(temp_path, root / CATALOG_PATH)
+    return len(strict_json_loads(raw, CATALOG_PATH)["packages"]), digest
 
 
 def check_signing_candidate(
@@ -1343,8 +1466,9 @@ def check_publication_worktree(
 ) -> tuple[str, list[str]]:
     """Validate the signer-only dirty shape after full cosign verification."""
     check_catalog(root, expected_identities=expected_identities)
+    validate_catalog_snapshot(root, expected_identities=expected_identities)
     kit_names = sorted(expected_identities)
-    allowed = {PACKAGE_MARKER}
+    allowed = {PACKAGE_MARKER, CATALOG_PATH, CATALOG_SIGNATURE_PATH}
     for kit_name in kit_names:
         allowed.update(
             {
@@ -1362,6 +1486,7 @@ def check_publication_worktree(
 
     if _git_file(root, "HEAD", PACKAGE_MARKER) is None:
         expected_bootstrap = {PACKAGE_MARKER}
+        expected_bootstrap.update({CATALOG_PATH, CATALOG_SIGNATURE_PATH})
         for kit_name in kit_names:
             expected_bootstrap.update(
                 {
@@ -1372,7 +1497,7 @@ def check_publication_worktree(
         _require(
             set(dirty_paths) == expected_bootstrap,
             "package-v1 bootstrap must publish exactly the activation marker and "
-            f"{len(kit_names) * 2} package descriptor artifacts; "
+            f"{len(kit_names) * 2} package descriptor artifacts and the signed catalog; "
             f"missing={sorted(expected_bootstrap - set(dirty_paths))}, "
             f"extra={sorted(set(dirty_paths) - expected_bootstrap)}",
         )
@@ -1451,7 +1576,8 @@ def _historical_id_versions(
 
 def changed_paths(root: Path, base_ref: str) -> list[str]:
     raw = _git_output(
-        root, ["diff", "--name-only", "-z", base_ref, "HEAD", "--", "kits"]
+        root,
+        ["diff", "--name-only", "-z", base_ref, "HEAD", "--", "kits", CATALOG_DIR],
     )
     return [path.decode("utf-8") for path in raw.split(b"\0") if path]
 
@@ -1508,11 +1634,14 @@ def ci_check(
         DESCRIPTOR_SIGNATURE_NAME,
     }
     generated_changes = sorted(
-        path for path in paths if path.split("/")[-1] in generated_names
+        path
+        for path in paths
+        if path.split("/")[-1] in generated_names
+        or path in {CATALOG_PATH, CATALOG_SIGNATURE_PATH}
     )
     _require(
         not generated_changes,
-        "package descriptors and detached signatures may change only inside the "
+        "package descriptors, catalog, and detached signatures may change only inside the "
         "main signing workflow after exact cosign identity verification: "
         f"{generated_changes}",
     )
@@ -1575,6 +1704,12 @@ def main(argv: list[str]) -> int:
     subparsers.add_parser("generate")
     subparsers.add_parser("publication-check")
 
+    catalog_generate_parser = subparsers.add_parser("catalog-generate")
+    catalog_generate_parser.add_argument("--source-revision", required=True)
+    catalog_generate_parser.add_argument("--sequence", required=True, type=int)
+    subparsers.add_parser("catalog-check")
+    subparsers.add_parser("catalog-next-sequence")
+
     ci_parser = subparsers.add_parser("ci-check")
     ci_parser.add_argument("--base-ref", required=True)
 
@@ -1584,6 +1719,27 @@ def main(argv: list[str]) -> int:
         if args.command == "generate":
             generated = generate_catalog(root)
             _print_result("generated", generated)
+            return 0
+        if args.command == "catalog-generate":
+            count, digest = generate_catalog_snapshot(
+                root,
+                source_revision=args.source_revision,
+                sequence=args.sequence,
+            )
+            print(
+                f"package_kits: generated pinned catalog with {count} packages "
+                f"sha256:{digest}"
+            )
+            return 0
+        if args.command == "catalog-check":
+            sequence, count, digest = validate_catalog_snapshot(root)
+            print(
+                f"package_kits: pinned catalog sequence {sequence} passed "
+                f"({count} packages, sha256:{digest})"
+            )
+            return 0
+        if args.command == "catalog-next-sequence":
+            print(next_catalog_sequence(root))
             return 0
         if args.command == "publication-check":
             state, paths = check_publication_worktree(root)

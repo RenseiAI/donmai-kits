@@ -8,9 +8,10 @@ name: sign
 #      kit.version bump for any payload change);
 #   3. generate canonical kit.package.json after the legacy bundle is stable;
 #   4. sign + verify kit.package.json; and
-#   5. stage every descriptor/bundle plus the activation marker;
-#   6. verify an immutable archive of that exact Git tree; and
-#   7. commit only when the resulting commit has that verified tree.
+#   5. advance and sign the pinned catalog only when descriptors changed;
+#   6. stage every descriptor/bundle, catalog artifact, and activation marker;
+#   7. verify an immutable archive of that exact Git tree; and
+#   8. commit only when the resulting commit has that verified tree.
 #
 # The descriptor inventories kit.toml.sigstore, so refreshing an unchanged
 # legacy bundle would change package identity at the same kit id/version. The
@@ -96,6 +97,32 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${GITHUB_REF}" != "refs/heads/main" ]]; then
             echo "::error::manual package verification is restricted to refs/heads/main"
             exit 1
+          fi
+
+      - name: Validate previous pinned catalog and reserve its next sequence
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          snapshot="catalog/kit-catalog.json"
+          bundle="catalog/kit-catalog.json.sigstore"
+          if [[ -f "${snapshot}" && -f "${bundle}" ]]; then
+            python3 scripts/package_kits.py catalog-check
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${snapshot}"
+          elif [[ -e "${snapshot}" || -e "${bundle}" ]]; then
+            echo "::error::pinned catalog snapshot and signature must appear together"
+            exit 1
+          elif [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::verify-only events require an existing signed catalog"
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "CATALOG_NEXT_SEQUENCE=$(python3 scripts/package_kits.py catalog-next-sequence)" >> "${GITHUB_ENV}"
           fi
 
       - name: Preserve or sign legacy manifest compatibility bundles
@@ -208,12 +235,43 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Sign or preserve the pinned catalog snapshot
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          snapshot="catalog/kit-catalog.json"
+          bundle="catalog/kit-catalog.json.sigstore"
+          descriptor_changes="$(git status --porcelain=v1 -- kits/*/kit.package.json)"
+          if [[ ! -f "${snapshot}" || -n "${descriptor_changes}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+              echo "::error::catalog needs a new trusted signature, but this event is verify-only"
+              exit 1
+            fi
+            python3 scripts/package_kits.py catalog-generate \
+              --source-revision "${GITHUB_SHA}" \
+              --sequence "${CATALOG_NEXT_SEQUENCE}"
+            cosign sign-blob \
+              --yes \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              "${snapshot}"
+          fi
+          python3 scripts/package_kits.py catalog-check
+          cosign verify-blob \
+            --new-bundle-format=true \
+            --bundle "${bundle}" \
+            --certificate-identity "${EXPECTED_SAN}" \
+            --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+            "${snapshot}"
+
       - name: Activate and fail-closed validate the published package set
         run: |
           set -euo pipefail
           printf '%s' '{"schema":"donmai.dev/kit-package/v1","state":"active"}' > .kit-package-v1-active
           python3 scripts/validate_kits.py
           python3 scripts/package_kits.py check
+          python3 scripts/package_kits.py catalog-check
 
       - name: Verify immutable package tree and commit it back to main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -229,7 +287,9 @@ jobs:
             .kit-package-v1-active \
             kits/*/kit.toml.sigstore \
             kits/*/kit.package.json \
-            kits/*/kit.package.json.sigstore
+            kits/*/kit.package.json.sigstore \
+            catalog/kit-catalog.json \
+            catalog/kit-catalog.json.sigstore
 
           # Bind the signer output to the only allowed dirty shape before
           # deriving the candidate Git tree. Authored payload remains the
@@ -251,6 +311,7 @@ jobs:
           # classes against the exact bytes and modes in the candidate tree.
           python3 "${snapshot}/scripts/validate_kits.py"
           python3 "${snapshot}/scripts/package_kits.py" check
+          python3 "${snapshot}/scripts/package_kits.py" catalog-check
 
           kits=(go java python ruby rust swift ts-nextjs typescript)
           for kit in "${kits[@]}"; do
@@ -271,6 +332,14 @@ jobs:
               "${descriptor}"
           done
 
+          catalog="${snapshot}/catalog/kit-catalog.json"
+          cosign verify-blob \
+            --new-bundle-format=true \
+            --bundle "${catalog}.sigstore" \
+            --certificate-identity "${EXPECTED_SAN}" \
+            --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+            "${catalog}"
+
           if [[ "$(git write-tree)" != "${candidate_tree}" ]]; then
             echo "::error::staged publication changed during immutable-tree verification"
             exit 1
@@ -289,5 +358,6 @@ jobs:
           name: signed-kit-packages
           path: |
             .kit-package-v1-active
+            catalog/**
             kits/*/**
           if-no-files-found: error

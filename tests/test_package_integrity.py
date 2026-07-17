@@ -14,6 +14,9 @@ from unittest.mock import patch
 
 from scripts.package_kits import (
     CATALOG_CANDIDATE_SCHEMA,
+    CATALOG_PATH,
+    CATALOG_SCHEMA,
+    CATALOG_SIGNATURE_PATH,
     DESCRIPTOR_NAME,
     DESCRIPTOR_SIGNATURE_NAME,
     EXPECTED_KIT_IDENTITIES,
@@ -25,6 +28,7 @@ from scripts.package_kits import (
     PackageError,
     _record_catalog_identity,
     build_catalog_snapshot_candidate,
+    build_catalog_snapshot,
     build_descriptor,
     canonical_json_bytes,
     check_catalog,
@@ -35,8 +39,11 @@ from scripts.package_kits import (
     ensure_unique_portable_paths,
     first_publication_pending,
     generate_catalog,
+    generate_catalog_snapshot,
+    next_catalog_sequence,
     portable_collision_key,
     validate_descriptor,
+    validate_catalog_snapshot,
     validate_portable_path,
     verify_unicode_profile,
 )
@@ -109,6 +116,20 @@ def _publish(root: Path, kit_dir: Path) -> None:
     descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
     (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(descriptor))
     (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+    _publish_catalog_snapshot(root)
+
+
+def _publish_catalog_snapshot(
+    root: Path, *, source_revision: str = "1" * 40, sequence: int = 1
+) -> None:
+    generate_catalog_snapshot(
+        root,
+        source_revision=source_revision,
+        sequence=sequence,
+        expected_identities=FIXTURE_KIT_IDENTITIES,
+    )
+    snapshot = (root / CATALOG_PATH).read_bytes()
+    (root / CATALOG_SIGNATURE_PATH).write_bytes(_fixture_bundle(snapshot))
 
 
 def _write_pending_kit(root: Path, name: str) -> Path:
@@ -418,6 +439,7 @@ class CatalogCandidateTests(unittest.TestCase):
             )
             self.assertIn(f'api = "{EXPECTED_MANIFEST_API}"', manifest)
 
+
     def test_malformed_revision_sequence_and_locator_fail_closed(self) -> None:
         cases = (
             {"source_revision": "short"},
@@ -493,6 +515,90 @@ class CatalogCandidateTests(unittest.TestCase):
         baseline = self._build()
         self.assertNotEqual(baseline[1], self._build(source_revision="2" * 40)[1])
         self.assertNotEqual(baseline[1], self._build(sequence=2)[1])
+
+
+class SignedCatalogSnapshotTests(unittest.TestCase):
+    REVISION = "2" * 40
+
+    def test_snapshot_is_canonical_deterministic_and_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _publish(root, _write_kit(root))
+            first = build_catalog_snapshot(
+                root,
+                source_revision=self.REVISION,
+                sequence=2,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+            )
+            second = build_catalog_snapshot(
+                root,
+                source_revision=self.REVISION,
+                sequence=2,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+            )
+            self.assertEqual(first, second)
+            value = json.loads(first[0])
+            self.assertEqual(CATALOG_SCHEMA, value["schema"])
+            self.assertNotIn("state", value)
+
+            _publish_catalog_snapshot(
+                root, source_revision=self.REVISION, sequence=2
+            )
+            self.assertEqual(
+                (2, 1, first[1]),
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+
+    def test_snapshot_and_signature_tampering_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _publish(root, _write_kit(root))
+            snapshot_path = root / CATALOG_PATH
+            snapshot = json.loads(snapshot_path.read_bytes())
+            snapshot["packages"][0]["packageDigest"] = "0" * 64
+            snapshot_path.write_bytes(canonical_json_bytes(snapshot))
+            with self.assertRaisesRegex(PackageError, "exactly inventory"):
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
+
+            _publish_catalog_snapshot(root)
+            (root / CATALOG_SIGNATURE_PATH).write_bytes(_fixture_bundle(b"wrong"))
+            with self.assertRaisesRegex(PackageError, "subject digest does not match"):
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
+
+    def test_sequence_bootstraps_and_advances_only_from_valid_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_kit(root)
+            _generate_catalog(root)
+            descriptor = root / "kits" / "demo" / DESCRIPTOR_NAME
+            (descriptor.parent / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+                _fixture_bundle(descriptor.read_bytes())
+            )
+            (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+            self.assertEqual(
+                1,
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+            _publish_catalog_snapshot(root, sequence=7)
+            self.assertEqual(
+                8,
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+            (root / CATALOG_SIGNATURE_PATH).unlink()
+            with self.assertRaisesRegex(PackageError, "must appear together"):
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
 
 
 class PortablePathTests(unittest.TestCase):
@@ -868,6 +974,8 @@ class CandidateStateTests(unittest.TestCase):
         self.assertEqual(
             {
                 PACKAGE_MARKER,
+                CATALOG_PATH,
+                CATALOG_SIGNATURE_PATH,
                 f"kits/demo/{DESCRIPTOR_NAME}",
                 f"kits/demo/{DESCRIPTOR_SIGNATURE_NAME}",
             },
