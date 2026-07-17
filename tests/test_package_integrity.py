@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,9 @@ from unittest.mock import patch
 
 from scripts.package_kits import (
     CATALOG_CANDIDATE_SCHEMA,
+    CATALOG_PATH,
+    CATALOG_SCHEMA,
+    CATALOG_SIGNATURE_PATH,
     DESCRIPTOR_NAME,
     DESCRIPTOR_SIGNATURE_NAME,
     EXPECTED_KIT_IDENTITIES,
@@ -25,9 +29,12 @@ from scripts.package_kits import (
     PackageError,
     _record_catalog_identity,
     build_catalog_snapshot_candidate,
+    build_catalog_snapshot,
     build_descriptor,
     canonical_json_bytes,
     check_catalog,
+    check_catalog_publication_worktree,
+    check_package_publication_worktree,
     check_publication_worktree,
     check_version_bumps,
     ci_check,
@@ -35,8 +42,12 @@ from scripts.package_kits import (
     ensure_unique_portable_paths,
     first_publication_pending,
     generate_catalog,
+    generate_catalog_snapshot,
+    next_catalog_sequence,
     portable_collision_key,
     validate_descriptor,
+    validate_catalog_snapshot,
+    validate_catalog_source_revision,
     validate_portable_path,
     verify_unicode_profile,
 )
@@ -109,6 +120,20 @@ def _publish(root: Path, kit_dir: Path) -> None:
     descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
     (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(_fixture_bundle(descriptor))
     (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+    _publish_catalog_snapshot(root)
+
+
+def _publish_catalog_snapshot(
+    root: Path, *, source_revision: str = "1" * 40, sequence: int = 1
+) -> None:
+    generate_catalog_snapshot(
+        root,
+        source_revision=source_revision,
+        sequence=sequence,
+        expected_identities=FIXTURE_KIT_IDENTITIES,
+    )
+    snapshot = (root / CATALOG_PATH).read_bytes()
+    (root / CATALOG_SIGNATURE_PATH).write_bytes(_fixture_bundle(snapshot))
 
 
 def _write_pending_kit(root: Path, name: str) -> Path:
@@ -418,6 +443,7 @@ class CatalogCandidateTests(unittest.TestCase):
             )
             self.assertIn(f'api = "{EXPECTED_MANIFEST_API}"', manifest)
 
+
     def test_malformed_revision_sequence_and_locator_fail_closed(self) -> None:
         cases = (
             {"source_revision": "short"},
@@ -493,6 +519,241 @@ class CatalogCandidateTests(unittest.TestCase):
         baseline = self._build()
         self.assertNotEqual(baseline[1], self._build(source_revision="2" * 40)[1])
         self.assertNotEqual(baseline[1], self._build(sequence=2)[1])
+
+
+class SignedCatalogSnapshotTests(unittest.TestCase):
+    REVISION = "2" * 40
+
+    def test_snapshot_is_canonical_deterministic_and_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _publish(root, _write_kit(root))
+            first = build_catalog_snapshot(
+                root,
+                source_revision=self.REVISION,
+                sequence=2,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+            )
+            second = build_catalog_snapshot(
+                root,
+                source_revision=self.REVISION,
+                sequence=2,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+            )
+            self.assertEqual(first, second)
+            value = json.loads(first[0])
+            self.assertEqual(CATALOG_SCHEMA, value["schema"])
+            self.assertNotIn("state", value)
+
+            _publish_catalog_snapshot(
+                root, source_revision=self.REVISION, sequence=2
+            )
+            self.assertEqual(
+                (2, 1, first[1]),
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+
+    def test_snapshot_and_signature_tampering_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _publish(root, _write_kit(root))
+            snapshot_path = root / CATALOG_PATH
+            snapshot = json.loads(snapshot_path.read_bytes())
+            snapshot["packages"][0]["packageDigest"] = "0" * 64
+            snapshot_path.write_bytes(canonical_json_bytes(snapshot))
+            with self.assertRaisesRegex(PackageError, "exactly inventory"):
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
+
+            _publish_catalog_snapshot(root)
+            (root / CATALOG_SIGNATURE_PATH).write_bytes(_fixture_bundle(b"wrong"))
+            with self.assertRaisesRegex(PackageError, "subject digest does not match"):
+                validate_catalog_snapshot(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
+
+    def test_sequence_bootstraps_and_advances_only_from_valid_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_kit(root)
+            _generate_catalog(root)
+            descriptor = root / "kits" / "demo" / DESCRIPTOR_NAME
+            (descriptor.parent / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+                _fixture_bundle(descriptor.read_bytes())
+            )
+            (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+            self.assertEqual(
+                1,
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+            _publish_catalog_snapshot(root, sequence=7)
+            self.assertEqual(
+                8,
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                ),
+            )
+            (root / CATALOG_SIGNATURE_PATH).unlink()
+            with self.assertRaisesRegex(PackageError, "must appear together"):
+                next_catalog_sequence(
+                    root, expected_identities=FIXTURE_KIT_IDENTITIES
+                )
+
+
+class CatalogSourceRevisionTests(unittest.TestCase):
+    def _write_package_stage(self, root: Path) -> Path:
+        kit_dir = root / "kits" / "demo"
+        if not kit_dir.exists():
+            kit_dir = _write_kit(root)
+        _generate_catalog(root)
+        descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
+        (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+            _fixture_bundle(descriptor)
+        )
+        (root / PACKAGE_MARKER).write_bytes(PACKAGE_MARKER_BYTES)
+        return kit_dir
+
+    def test_descriptor_commit_then_catalog_stage_binds_immutable_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_kit(root)
+            _commit_fixture(root)
+            self._write_package_stage(root)
+
+            package_state, package_paths = check_package_publication_worktree(
+                root, expected_identities=FIXTURE_KIT_IDENTITIES
+            )
+            self.assertEqual("bootstrap-package-publication", package_state)
+            self.assertEqual(
+                {
+                    PACKAGE_MARKER,
+                    f"kits/demo/{DESCRIPTOR_NAME}",
+                    f"kits/demo/{DESCRIPTOR_SIGNATURE_NAME}",
+                },
+                set(package_paths),
+            )
+
+            _commit_changes(root, "publish descriptor bytes")
+            source_revision = _git(root, "rev-parse", "HEAD")
+            generate_catalog_snapshot(
+                root,
+                source_revision=source_revision,
+                sequence=1,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+                source_repository=root,
+            )
+            catalog = (root / CATALOG_PATH).read_bytes()
+            (root / CATALOG_SIGNATURE_PATH).write_bytes(_fixture_bundle(catalog))
+
+            self.assertEqual(
+                (source_revision, 1),
+                validate_catalog_source_revision(root, catalog),
+            )
+            catalog_state, catalog_paths = check_catalog_publication_worktree(
+                root,
+                expected_identities=FIXTURE_KIT_IDENTITIES,
+                source_repository=root,
+            )
+            self.assertEqual("catalog-publication-update", catalog_state)
+            self.assertEqual(
+                {CATALOG_PATH, CATALOG_SIGNATURE_PATH}, set(catalog_paths)
+            )
+
+    def test_dirty_descriptor_cannot_claim_the_checkout_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit_dir = self._write_package_stage(root)
+            source_revision = _commit_fixture(root)
+
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace("1.0.0", "1.0.1"),
+                encoding="utf-8",
+            )
+            (kit_dir / "data" / "notes.txt").write_text(
+                "changed after checkout\n", encoding="utf-8"
+            )
+            (kit_dir / "kit.toml.sigstore").write_bytes(
+                _fixture_bundle(manifest.read_bytes())
+            )
+            _generate_catalog(root)
+            descriptor = (kit_dir / DESCRIPTOR_NAME).read_bytes()
+            (kit_dir / DESCRIPTOR_SIGNATURE_NAME).write_bytes(
+                _fixture_bundle(descriptor)
+            )
+
+            with self.assertRaisesRegex(PackageError, "digest mismatch"):
+                generate_catalog_snapshot(
+                    root,
+                    source_revision=source_revision,
+                    sequence=1,
+                    expected_identities=FIXTURE_KIT_IDENTITIES,
+                    source_repository=root,
+                )
+
+    def test_source_revision_without_locator_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_kit(root)
+            source_revision = _commit_fixture(root)
+            self._write_package_stage(root)
+
+            with self.assertRaisesRegex(PackageError, "does not contain"):
+                generate_catalog_snapshot(
+                    root,
+                    source_revision=source_revision,
+                    sequence=1,
+                    expected_identities=FIXTURE_KIT_IDENTITIES,
+                    source_repository=root,
+                )
+
+
+class SigningWorkflowTrustTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = (ROOT / ".github" / "workflows" / "sign.yml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_every_action_is_pinned_to_a_full_commit(self) -> None:
+        actions = re.findall(
+            r"^\s*-\s+uses:\s*([^\s#]+)", self.workflow, flags=re.MULTILINE
+        )
+        self.assertGreater(len(actions), 0)
+        for action in actions:
+            with self.subTest(action=action):
+                self.assertRegex(action, r"^[^/@\s]+/[^@\s]+@[0-9a-f]{40}$")
+
+    def test_oidc_signer_and_repository_writer_are_separate_jobs(self) -> None:
+        before_jobs, jobs = self.workflow.split("\njobs:\n", 1)
+        sign_job, publish_job = jobs.split("\n  publish:\n", 1)
+        self.assertNotIn("id-token: write", before_jobs)
+        self.assertIn("contents: read\n      id-token: write", sign_job)
+        self.assertNotIn("contents: write", sign_job)
+        self.assertIn("contents: write", publish_job)
+        self.assertNotIn("id-token: write", publish_job)
+        self.assertNotIn("git push", sign_job)
+        self.assertIn("git push origin", publish_job)
+
+    def test_catalog_signing_follows_the_descriptor_commit(self) -> None:
+        descriptor_commit = self.workflow.index(
+            "Commit the immutable descriptor-containing revision"
+        )
+        catalog_generate = self.workflow.index("catalog-generate")
+        catalog_commit = self.workflow.index(
+            "Commit the immutable signed catalog revision"
+        )
+        bundle = self.workflow.index("Prepare immutable publication bundle")
+        self.assertLess(descriptor_commit, catalog_generate)
+        self.assertLess(catalog_generate, catalog_commit)
+        self.assertLess(catalog_commit, bundle)
+        self.assertIn('source_revision="$(git rev-parse HEAD)"', self.workflow)
+        self.assertIn('--source-revision "${source_revision}"', self.workflow)
 
 
 class PortablePathTests(unittest.TestCase):
@@ -868,6 +1129,8 @@ class CandidateStateTests(unittest.TestCase):
         self.assertEqual(
             {
                 PACKAGE_MARKER,
+                CATALOG_PATH,
+                CATALOG_SIGNATURE_PATH,
                 f"kits/demo/{DESCRIPTOR_NAME}",
                 f"kits/demo/{DESCRIPTOR_SIGNATURE_NAME}",
             },

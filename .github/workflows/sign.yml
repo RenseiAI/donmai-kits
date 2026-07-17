@@ -8,9 +8,10 @@ name: sign
 #      kit.version bump for any payload change);
 #   3. generate canonical kit.package.json after the legacy bundle is stable;
 #   4. sign + verify kit.package.json; and
-#   5. stage every descriptor/bundle plus the activation marker;
-#   6. verify an immutable archive of that exact Git tree; and
-#   7. commit only when the resulting commit has that verified tree.
+#   5. commit and verify the descriptor-containing Git revision locally;
+#   6. generate the pinned catalog from that immutable revision, then sign it;
+#   7. verify both local commits and transfer them as an immutable Git bundle; and
+#   8. let a separate, non-OIDC publisher fast-forward main to the verified head.
 #
 # The descriptor inventories kit.toml.sigstore, so refreshing an unchanged
 # legacy bundle would change package identity at the same kit id/version. The
@@ -32,8 +33,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: sign-${{ github.ref }}
@@ -50,11 +50,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -77,18 +77,24 @@ jobs:
     name: keyless-sign complete kit packages
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      publication-needed: ${{ steps.prepare-publication.outputs.needed }}
+      publication-head: ${{ steps.prepare-publication.outputs.head }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          persist-credentials: true
+          persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.7.0
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       - name: Require a publishable ref
         run: |
@@ -96,6 +102,32 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${GITHUB_REF}" != "refs/heads/main" ]]; then
             echo "::error::manual package verification is restricted to refs/heads/main"
             exit 1
+          fi
+
+      - name: Validate previous pinned catalog and reserve its next sequence
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          snapshot="catalog/kit-catalog.json"
+          bundle="catalog/kit-catalog.json.sigstore"
+          if [[ -f "${snapshot}" && -f "${bundle}" ]]; then
+            python3 scripts/package_kits.py catalog-check
+            cosign verify-blob \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              --certificate-identity "${EXPECTED_SAN}" \
+              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+              "${snapshot}"
+          elif [[ -e "${snapshot}" || -e "${bundle}" ]]; then
+            echo "::error::pinned catalog snapshot and signature must appear together"
+            exit 1
+          elif [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::verify-only events require an existing signed catalog"
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "CATALOG_NEXT_SEQUENCE=$(python3 scripts/package_kits.py catalog-next-sequence)" >> "${GITHUB_ENV}"
           fi
 
       - name: Preserve or sign legacy manifest compatibility bundles
@@ -215,14 +247,10 @@ jobs:
           python3 scripts/validate_kits.py
           python3 scripts/package_kits.py check
 
-      - name: Verify immutable package tree and commit it back to main
+      - name: Commit the immutable descriptor-containing revision
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "::error::package publication commits are restricted to a main push"
-            exit 1
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add \
@@ -231,63 +259,277 @@ jobs:
             kits/*/kit.package.json \
             kits/*/kit.package.json.sigstore
 
-          # Bind the signer output to the only allowed dirty shape before
-          # deriving the candidate Git tree. Authored payload remains the
-          # already-reviewed HEAD tree; only generated publication files are
-          # staged here.
-          python3 scripts/package_kits.py publication-check
-          if git diff --cached --quiet; then
-            echo "no package publication changes to commit"
-            exit 0
+          python3 scripts/package_kits.py publication-check --phase packages
+          if ! git diff --cached --quiet; then
+            package_tree="$(git write-tree)"
+            package_archive="$(mktemp -d)"
+            trap 'rm -rf "${package_archive}"' EXIT
+            git archive --format=tar "${package_tree}" | tar -xf - -C "${package_archive}"
+
+            python3 "${package_archive}/scripts/validate_kits.py"
+            python3 "${package_archive}/scripts/package_kits.py" check
+            kits=(go java python ruby rust swift ts-nextjs typescript)
+            for kit in "${kits[@]}"; do
+              manifest="${package_archive}/kits/${kit}/kit.toml"
+              cosign verify-blob \
+                --new-bundle-format=true \
+                --bundle "${manifest}.sigstore" \
+                --certificate-identity "${EXPECTED_SAN}" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${manifest}"
+              descriptor="${package_archive}/kits/${kit}/kit.package.json"
+              cosign verify-blob \
+                --new-bundle-format=true \
+                --bundle "${descriptor}.sigstore" \
+                --certificate-identity "${EXPECTED_SAN}" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${descriptor}"
+            done
+            if [[ "$(git write-tree)" != "${package_tree}" ]]; then
+              echo "::error::descriptor stage changed during immutable verification"
+              exit 1
+            fi
+            git commit -m "chore(sign): publish signed kit packages [skip ci]"
+            if [[ "$(git rev-parse 'HEAD^{tree}')" != "${package_tree}" ]]; then
+              echo "::error::descriptor commit does not contain the verified tree"
+              exit 1
+            fi
           fi
 
-          candidate_tree="$(git write-tree)"
-          snapshot="$(mktemp -d)"
-          trap 'rm -rf "${snapshot}"' EXIT
-          git archive --format=tar "${candidate_tree}" | tar -xf - -C "${snapshot}"
+      - name: Sign or preserve the pinned catalog snapshot
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          snapshot="catalog/kit-catalog.json"
+          bundle="catalog/kit-catalog.json.sigstore"
+          source_revision="$(git rev-parse HEAD)"
+          if [[ ! -f "${snapshot}" || "${source_revision}" != "${GITHUB_SHA}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" != "push" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+              echo "::error::catalog needs a new trusted signature, but this event is verify-only"
+              exit 1
+            fi
+            python3 scripts/package_kits.py catalog-generate \
+              --source-revision "${source_revision}" \
+              --sequence "${CATALOG_NEXT_SEQUENCE}"
+            cosign sign-blob \
+              --yes \
+              --new-bundle-format=true \
+              --bundle "${bundle}" \
+              "${snapshot}"
+          fi
+          python3 scripts/package_kits.py catalog-check \
+            --source-repository "${GITHUB_WORKSPACE}"
+          cosign verify-blob \
+            --new-bundle-format=true \
+            --bundle "${bundle}" \
+            --certificate-identity "${EXPECTED_SAN}" \
+            --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+            "${snapshot}"
 
-          # This archive, not the mutable Actions worktree, is the publication
-          # authority. Recompute every inventory and re-verify both signature
-          # classes against the exact bytes and modes in the candidate tree.
-          python3 "${snapshot}/scripts/validate_kits.py"
-          python3 "${snapshot}/scripts/package_kits.py" check
-
-          kits=(go java python ruby rust swift ts-nextjs typescript)
-          for kit in "${kits[@]}"; do
-            manifest="${snapshot}/kits/${kit}/kit.toml"
+      - name: Commit the immutable signed catalog revision
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          git add catalog/kit-catalog.json catalog/kit-catalog.json.sigstore
+          python3 scripts/package_kits.py publication-check \
+            --phase catalog \
+            --source-repository "${GITHUB_WORKSPACE}"
+          if ! git diff --cached --quiet; then
+            catalog_tree="$(git write-tree)"
+            catalog_archive="$(mktemp -d)"
+            trap 'rm -rf "${catalog_archive}"' EXIT
+            git archive --format=tar "${catalog_tree}" | tar -xf - -C "${catalog_archive}"
+            python3 "${catalog_archive}/scripts/validate_kits.py"
+            python3 "${catalog_archive}/scripts/package_kits.py" check
+            python3 "${catalog_archive}/scripts/package_kits.py" catalog-check \
+              --source-repository "${GITHUB_WORKSPACE}"
+            kits=(go java python ruby rust swift ts-nextjs typescript)
+            for kit in "${kits[@]}"; do
+              manifest="${catalog_archive}/kits/${kit}/kit.toml"
+              cosign verify-blob \
+                --new-bundle-format=true \
+                --bundle "${manifest}.sigstore" \
+                --certificate-identity "${EXPECTED_SAN}" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${manifest}"
+              descriptor="${catalog_archive}/kits/${kit}/kit.package.json"
+              cosign verify-blob \
+                --new-bundle-format=true \
+                --bundle "${descriptor}.sigstore" \
+                --certificate-identity "${EXPECTED_SAN}" \
+                --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
+                "${descriptor}"
+            done
+            catalog="${catalog_archive}/catalog/kit-catalog.json"
             cosign verify-blob \
               --new-bundle-format=true \
-              --bundle "${manifest}.sigstore" \
+              --bundle "${catalog}.sigstore" \
               --certificate-identity "${EXPECTED_SAN}" \
               --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
-              "${manifest}"
-
-            descriptor="${snapshot}/kits/${kit}/kit.package.json"
-            cosign verify-blob \
-              --new-bundle-format=true \
-              --bundle "${descriptor}.sigstore" \
-              --certificate-identity "${EXPECTED_SAN}" \
-              --certificate-oidc-issuer "${EXPECTED_ISSUER}" \
-              "${descriptor}"
-          done
-
-          if [[ "$(git write-tree)" != "${candidate_tree}" ]]; then
-            echo "::error::staged publication changed during immutable-tree verification"
-            exit 1
+              "${catalog}"
+            if [[ "$(git write-tree)" != "${catalog_tree}" ]]; then
+              echo "::error::catalog stage changed during immutable verification"
+              exit 1
+            fi
+            git commit -m "chore(sign): publish pinned kit catalog [skip ci]"
+            if [[ "$(git rev-parse 'HEAD^{tree}')" != "${catalog_tree}" ]]; then
+              echo "::error::catalog commit does not contain the verified tree"
+              exit 1
+            fi
           fi
-          git commit -m "chore(sign): publish signed kit packages [skip ci]"
-          if [[ "$(git rev-parse 'HEAD^{tree}')" != "${candidate_tree}" ]]; then
-            echo "::error::publication commit does not contain the verified candidate tree"
-            exit 1
+
+      - name: Prepare immutable publication bundle
+        id: prepare-publication
+        run: |
+          set -euo pipefail
+          echo "needed=false" >> "${GITHUB_OUTPUT}"
+          echo "head=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" && "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            publication_head="$(git rev-parse HEAD)"
+            git merge-base --is-ancestor "${GITHUB_SHA}" "${publication_head}"
+            commit_count="$(git rev-list --count "${GITHUB_SHA}..${publication_head}")"
+            if [[ "${commit_count}" -lt 1 || "${commit_count}" -gt 2 ]]; then
+              echo "::error::publication must contain one catalog commit or descriptor+catalog commits"
+              exit 1
+            fi
+            git bundle create publication.bundle HEAD "^${GITHUB_SHA}"
+            git bundle verify publication.bundle
+            printf '%s\n' "${publication_head}" > publication-head.txt
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+            echo "head=${publication_head}" >> "${GITHUB_OUTPUT}"
           fi
-          git push
+
+      - name: Upload immutable publication bundle
+        if: steps.prepare-publication.outputs.needed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-kit-publication
+          path: |
+            publication.bundle
+            publication-head.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload signed packages as a build artifact
         if: github.event_name != 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: signed-kit-packages
           path: |
             .kit-package-v1-active
+            catalog/**
             kits/*/**
           if-no-files-found: error
+
+  publish:
+    name: fast-forward verified signed publication
+    needs: sign
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.sign.outputs.publication-needed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download immutable publication bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-kit-publication
+          path: .publication
+
+      - name: Validate topology, provenance, and fast-forward main
+        env:
+          EXPECTED_PUBLICATION_HEAD: ${{ needs.sign.outputs.publication-head }}
+        run: |
+          set -euo pipefail
+          declared_head="$(tr -d '\n' < .publication/publication-head.txt)"
+          if [[ "${declared_head}" != "${EXPECTED_PUBLICATION_HEAD}" ]]; then
+            echo "::error::publication artifact head does not match the signer output"
+            exit 1
+          fi
+          git bundle verify .publication/publication.bundle
+          git fetch .publication/publication.bundle HEAD:refs/remotes/publication/head
+          publication_head="$(git rev-parse refs/remotes/publication/head)"
+          if [[ "${publication_head}" != "${declared_head}" ]]; then
+            echo "::error::publication bundle does not contain its declared head"
+            exit 1
+          fi
+          git merge-base --is-ancestor "${GITHUB_SHA}" "${publication_head}"
+
+          python3 - "${GITHUB_SHA}" "${publication_head}" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import subprocess
+          import sys
+
+          base, head = sys.argv[1:]
+          kits = {"go", "java", "python", "ruby", "rust", "swift", "ts-nextjs", "typescript"}
+          catalog_paths = {"catalog/kit-catalog.json", "catalog/kit-catalog.json.sigstore"}
+          package_paths = {".kit-package-v1-active"}
+          for kit in kits:
+              package_paths.update({
+                  f"kits/{kit}/kit.toml.sigstore",
+                  f"kits/{kit}/kit.package.json",
+                  f"kits/{kit}/kit.package.json.sigstore",
+              })
+
+          def git(*args: str) -> bytes:
+              return subprocess.run(
+                  ["git", *args], check=True, stdout=subprocess.PIPE
+              ).stdout
+
+          commits = git("rev-list", "--reverse", f"{base}..{head}").decode().splitlines()
+          if len(commits) not in {1, 2}:
+              raise SystemExit("publication must contain one or two commits")
+          changed = []
+          for commit in commits:
+              paths = set(
+                  git("diff-tree", "--no-commit-id", "--name-only", "-r", commit)
+                  .decode()
+                  .splitlines()
+              )
+              changed.append(paths)
+          if len(commits) == 1:
+              if changed[0] != catalog_paths:
+                  raise SystemExit("single-commit publication must contain only the catalog pair")
+              expected_source = base
+          else:
+              if not changed[0] or not changed[0] <= package_paths:
+                  raise SystemExit("descriptor commit contains a non-package publication path")
+              if changed[1] != catalog_paths:
+                  raise SystemExit("catalog commit must contain exactly the catalog pair")
+              expected_source = commits[0]
+
+          catalog_raw = git("show", f"{head}:catalog/kit-catalog.json")
+          catalog = json.loads(catalog_raw)
+          if catalog.get("sourceRevision") != expected_source:
+              raise SystemExit("catalog does not identify the descriptor-containing commit")
+          for row in catalog.get("packages", []):
+              locator = row["descriptor"]
+              descriptor = git("show", f"{expected_source}:{locator}")
+              if hashlib.sha256(descriptor).hexdigest() != row["packageDigest"]:
+                  raise SystemExit(f"catalog source digest mismatch for {locator}")
+
+          bundle = json.loads(git("show", f"{head}:catalog/kit-catalog.json.sigstore"))
+          embedded = base64.b64decode(
+              bundle["messageSignature"]["messageDigest"]["digest"], validate=True
+          )
+          if embedded != hashlib.sha256(catalog_raw).digest():
+              raise SystemExit("catalog signature bundle does not bind the catalog bytes")
+          PY
+
+          remote_head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "${remote_head}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::main advanced after signing; refusing a stale publication"
+            exit 1
+          fi
+          git push origin "${publication_head}:refs/heads/main"
