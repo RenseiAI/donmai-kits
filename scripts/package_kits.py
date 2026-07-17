@@ -1058,6 +1058,76 @@ def _record_catalog_identity(
     identities[identity] = package_digest
 
 
+def validate_catalog_source_revision(
+    source_repository: Path,
+    snapshot: bytes | Mapping[str, Any],
+) -> tuple[str, int]:
+    """Prove that a catalog's descriptor locators exist at its Git revision.
+
+    The catalog is generated from a working tree, but its resolution input is the
+    immutable source revision. Re-reading every descriptor from Git prevents a
+    signer from recording the checkout revision while signing newer dirty bytes.
+    """
+    value = (
+        strict_json_loads(snapshot, "catalog source revision")
+        if isinstance(snapshot, bytes)
+        else snapshot
+    )
+    _require(isinstance(value, Mapping), "catalog source revision must be an object")
+    source_revision = value.get("sourceRevision")
+    _require(
+        isinstance(source_revision, str)
+        and FULL_GIT_REVISION_RE.fullmatch(source_revision) is not None,
+        "catalog sourceRevision must be a full lowercase 40-hex Git revision",
+    )
+    try:
+        object_type = _git_output(
+            source_repository, ["cat-file", "-t", source_revision]
+        ).decode("ascii", "strict").strip()
+    except (PackageError, UnicodeDecodeError) as exc:
+        raise PackageError(
+            f"catalog sourceRevision {source_revision} is not available"
+        ) from exc
+    _require(
+        object_type == "commit",
+        f"catalog sourceRevision {source_revision} must identify a Git commit",
+    )
+
+    packages = value.get("packages")
+    _require(isinstance(packages, list), "catalog packages must be an array")
+    for row in packages:
+        _require(isinstance(row, Mapping), "catalog package row must be an object")
+        locator = row.get("descriptor")
+        package_digest = row.get("packageDigest")
+        _require(isinstance(locator, str), "catalog descriptor locator must be a string")
+        _require(
+            isinstance(package_digest, str)
+            and SHA256_RE.fullmatch(package_digest) is not None,
+            f"catalog descriptor {locator!r} must carry a SHA-256 package digest",
+        )
+        descriptor_bytes = _git_file(source_repository, source_revision, locator)
+        _require(
+            descriptor_bytes is not None,
+            f"catalog sourceRevision {source_revision} does not contain {locator}",
+        )
+        _require(
+            hashlib.sha256(descriptor_bytes).hexdigest() == package_digest,
+            f"catalog sourceRevision {source_revision} has a digest mismatch for {locator}",
+        )
+        descriptor = strict_json_loads(
+            descriptor_bytes, f"{source_revision}:{locator}"
+        )
+        _require(
+            descriptor_bytes == canonical_json_bytes(descriptor),
+            f"catalog source descriptor {locator} is not canonical",
+        )
+        _require(
+            isinstance(descriptor, dict) and descriptor.get("kit") == row.get("kit"),
+            f"catalog source descriptor {locator} has a different kit identity/version",
+        )
+    return source_revision, len(packages)
+
+
 def build_catalog_snapshot_candidate(
     root: Path,
     *,
@@ -1224,6 +1294,7 @@ def validate_catalog_snapshot(
     root: Path,
     *,
     expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+    source_repository: Path | None = None,
 ) -> tuple[int, int, str]:
     """Validate the exact pinned snapshot and detached Sigstore subject."""
     snapshot_present, signature_present = _catalog_artifact_presence(root)
@@ -1250,6 +1321,8 @@ def validate_catalog_snapshot(
         raw == expected,
         "pinned catalog does not exactly inventory the current published packages",
     )
+    if source_repository is not None:
+        validate_catalog_source_revision(source_repository, value)
     validate_sigstore_bundle(root, root / CATALOG_SIGNATURE_PATH, raw)
     return value["sequence"], len(value["packages"]), digest
 
@@ -1280,6 +1353,7 @@ def generate_catalog_snapshot(
     source_revision: str,
     sequence: int,
     expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+    source_repository: Path | None = None,
 ) -> tuple[int, str]:
     """Atomically write a canonical catalog subject for main-only signing."""
     raw, digest = build_catalog_snapshot(
@@ -1288,6 +1362,8 @@ def generate_catalog_snapshot(
         sequence=sequence,
         expected_identities=expected_identities,
     )
+    if source_repository is not None:
+        validate_catalog_source_revision(source_repository, raw)
     catalog_dir = root / CATALOG_DIR
     catalog_dir.mkdir(mode=0o755, exist_ok=True)
     _require(
@@ -1457,6 +1533,91 @@ def _working_tree_paths(root: Path) -> list[str]:
         paths.append(path)
     _require(len(paths) == len(set(paths)), "publication worktree repeats a path")
     return sorted(paths)
+
+
+def _package_publication_paths(
+    expected_identities: Mapping[str, str],
+) -> set[str]:
+    allowed = {PACKAGE_MARKER}
+    for kit_name in expected_identities:
+        allowed.update(
+            {
+                f"kits/{kit_name}/{LEGACY_SIGNATURE_NAME}",
+                f"kits/{kit_name}/{DESCRIPTOR_NAME}",
+                f"kits/{kit_name}/{DESCRIPTOR_SIGNATURE_NAME}",
+            }
+        )
+    return allowed
+
+
+def check_package_publication_worktree(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+) -> tuple[str, list[str]]:
+    """Validate signer output before the descriptor-containing commit is made."""
+    check_catalog(root, expected_identities=expected_identities)
+    dirty_paths = _working_tree_paths(root)
+    allowed = _package_publication_paths(expected_identities)
+    unauthorized = sorted(set(dirty_paths) - allowed)
+    _require(
+        not unauthorized,
+        f"package signer produced unauthorized worktree changes: {unauthorized}",
+    )
+
+    if _git_file(root, "HEAD", PACKAGE_MARKER) is None:
+        expected_bootstrap = {PACKAGE_MARKER}
+        for kit_name in expected_identities:
+            expected_bootstrap.update(
+                {
+                    f"kits/{kit_name}/{DESCRIPTOR_NAME}",
+                    f"kits/{kit_name}/{DESCRIPTOR_SIGNATURE_NAME}",
+                }
+            )
+            legacy_path = f"kits/{kit_name}/{LEGACY_SIGNATURE_NAME}"
+            if _git_file(root, "HEAD", legacy_path) is None:
+                expected_bootstrap.add(legacy_path)
+        _require(
+            set(dirty_paths) == expected_bootstrap,
+            "package-v1 bootstrap must create exactly the activation marker and "
+            "authorized package artifacts; "
+            f"missing={sorted(expected_bootstrap - set(dirty_paths))}, "
+            f"extra={sorted(set(dirty_paths) - expected_bootstrap)}",
+        )
+        return "bootstrap-package-publication", dirty_paths
+    return "package-publication-update", dirty_paths
+
+
+def check_catalog_publication_worktree(
+    root: Path,
+    *,
+    expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
+    source_repository: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Validate the catalog-only stage after package bytes are committed."""
+    check_catalog(root, expected_identities=expected_identities)
+    validate_catalog_snapshot(
+        root,
+        expected_identities=expected_identities,
+        source_repository=source_repository,
+    )
+    dirty_paths = _working_tree_paths(root)
+    expected_catalog = {CATALOG_PATH, CATALOG_SIGNATURE_PATH}
+    _require(
+        set(dirty_paths) in (set(), expected_catalog),
+        "catalog publication must change exactly the snapshot and detached signature; "
+        f"dirty={dirty_paths}",
+    )
+    if dirty_paths:
+        raw, _ = _read_regular_file(root, root / CATALOG_PATH)
+        value = strict_json_loads(raw, CATALOG_PATH)
+        head = _git_output(root, ["rev-parse", "HEAD"]).decode("ascii", "strict").strip()
+        _require(
+            value.get("sourceRevision") == head,
+            "changed catalog sourceRevision must be the descriptor-containing HEAD",
+        )
+        return "catalog-publication-update", dirty_paths
+    return "catalog-publication-noop", dirty_paths
 
 
 def check_publication_worktree(
@@ -1702,12 +1863,17 @@ def main(argv: list[str]) -> int:
     check_parser.add_argument("--allow-legacy-only", action="store_true")
 
     subparsers.add_parser("generate")
-    subparsers.add_parser("publication-check")
+    publication_parser = subparsers.add_parser("publication-check")
+    publication_parser.add_argument(
+        "--phase", choices=("combined", "packages", "catalog"), default="combined"
+    )
+    publication_parser.add_argument("--source-repository", type=Path)
 
     catalog_generate_parser = subparsers.add_parser("catalog-generate")
     catalog_generate_parser.add_argument("--source-revision", required=True)
     catalog_generate_parser.add_argument("--sequence", required=True, type=int)
-    subparsers.add_parser("catalog-check")
+    catalog_check_parser = subparsers.add_parser("catalog-check")
+    catalog_check_parser.add_argument("--source-repository", type=Path)
     subparsers.add_parser("catalog-next-sequence")
 
     ci_parser = subparsers.add_parser("ci-check")
@@ -1725,6 +1891,7 @@ def main(argv: list[str]) -> int:
                 root,
                 source_revision=args.source_revision,
                 sequence=args.sequence,
+                source_repository=root,
             )
             print(
                 f"package_kits: generated pinned catalog with {count} packages "
@@ -1732,7 +1899,14 @@ def main(argv: list[str]) -> int:
             )
             return 0
         if args.command == "catalog-check":
-            sequence, count, digest = validate_catalog_snapshot(root)
+            source_repository = (
+                args.source_repository.resolve()
+                if args.source_repository is not None
+                else root
+            )
+            sequence, count, digest = validate_catalog_snapshot(
+                root, source_repository=source_repository
+            )
             print(
                 f"package_kits: pinned catalog sequence {sequence} passed "
                 f"({count} packages, sha256:{digest})"
@@ -1742,7 +1916,19 @@ def main(argv: list[str]) -> int:
             print(next_catalog_sequence(root))
             return 0
         if args.command == "publication-check":
-            state, paths = check_publication_worktree(root)
+            source_repository = (
+                args.source_repository.resolve()
+                if args.source_repository is not None
+                else root
+            )
+            if args.phase == "packages":
+                state, paths = check_package_publication_worktree(root)
+            elif args.phase == "catalog":
+                state, paths = check_catalog_publication_worktree(
+                    root, source_repository=source_repository
+                )
+            else:
+                state, paths = check_publication_worktree(root)
             print(
                 f"package_kits: {state} shape passed "
                 f"({len(paths)} generated worktree paths)"
