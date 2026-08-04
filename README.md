@@ -121,7 +121,7 @@ python3 -m unittest discover -s tests -v
 
 CI also runs the full unittest suite, adversarial package path/link/collision/
 extra/missing/mode/race cases, version-bump enforcement, and generated-file
-drift checks on every push and PR. Publication is frozen to the current seven
+drift checks on every push and PR. Publication is frozen to the current eight
 directory/kit-id pairs until the architecture expansion hold is explicitly
 lifted; additions, deletions, renames, and id substitutions fail before
 signing. During the one-time package activation, the package check uses the
@@ -151,7 +151,7 @@ issuer = https://token.actions.githubusercontent.com
 The package descriptor inventories every payload file — including the stable
 legacy manifest bundle — by normalized path, SHA-256, byte size, and portable
 mode. The descriptor excludes itself and its detached signature to avoid a
-cycle. The workflow signs in that exact order, stages all seven package
+cycle. The workflow signs in that exact order, stages all eight package
 publications plus the activation marker, and materializes that exact Git tree
 as an immutable archive. It recomputes every inventory and verifies both bundle
 classes from the archive, then commits only if the commit tree is byte-for-byte

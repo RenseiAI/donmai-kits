@@ -6,7 +6,7 @@ is mechanical, but a few cross-cutting gotchas bite if you skip them.
 
 ## Authoring a kit
 
-Catalog expansion is currently frozen at the seven authorized directory/kit-id
+Catalog expansion is currently frozen at the eight authorized directory/kit-id
 pairs. The package generator and signing workflow reject additions, deletions,
 renames, or id substitutions. The steps below apply to maintenance of those
 kits and to a future expansion only after the architecture hold is explicitly
@@ -131,7 +131,7 @@ The signing CI (master plan step 3.6) is live in
 1. Human PRs change only authored payload and bump `kit.version`. CI rejects
    generated descriptor/bundle edits, downgrade/mixed states, missing/extra
    inventory, path/link/collision/mode/race attacks, changes to the authorized
-   seven-kit set, and an unchanged version. Actor names never authorize edits
+   eight-kit set, and an unchanged version. Actor names never authorize edits
    to generated trust artifacts.
 2. On `main`, the signer verifies and preserves each unchanged
    `kit.toml.sigstore`. It re-signs a legacy manifest only when `kit.toml`
@@ -153,7 +153,7 @@ The signing CI (master plan step 3.6) is live in
 5. The signer stages only the authorized generated files, writes that exact Git
    tree, and materializes it as an immutable archive. From the archive, the
    strict published-state validator recomputes every descriptor from the exact
-   bytes/modes and requires all seven packages; cosign also re-verifies both
+   bytes/modes and requires all eight packages; cosign also re-verifies both
    bundle classes against the pinned SAN and issuer. One bot commit is allowed
    only when its tree exactly matches that verified tree. Release/tag runs are
    verify-only and reuse the main-identity bundles.
