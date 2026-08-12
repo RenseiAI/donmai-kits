@@ -21,12 +21,12 @@ api = "rensei.dev/v1"
 # hook BOTH source that env so `swift` resolves for the next command.
 # ---------------------------------------------------------------------------
 
-# Republication note: v1.1.0 signing recovery, 2026-08-12 — content unchanged
-# from the lane-demands release; this line exists to place the manifest in a
-# main-push diff, which is the only event the signer may re-sign from.
+# v1.1.1: republication of the never-signed v1.1.0 lane-demands release —
+# functionally identical; the version bump satisfies ci-check and the push
+# diff lets the signer (push-event-only identity) re-sign.
 [kit]
 id = "default/swift"
-version = "1.1.0"
+version = "1.1.1"
 name = "Swift"
 description = "OSS default foundation kit for Swift Package Manager projects. Detects Package.swift and provides a pinned Swift 6 toolchain (via swiftly), build/test/format commands, and Swift conventions. Scope: Swift logic modules build/test on Linux; iOS/macOS app build, UI test, and screenshot are macOS-pool only."
 author = "donmai"
