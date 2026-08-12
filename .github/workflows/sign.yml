@@ -80,8 +80,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: true
+          # Push via the SIGN_PUBLISH_DEPLOY_KEY deploy key (a ruleset
+          # bypass actor) instead of the workflow GITHUB_TOKEN: the default
+          # branch ruleset requires status checks the signer's publish
+          # commit cannot carry, and GitHub offers no bypass entry for the
+          # Actions app itself — deploy keys are the sanctioned bypass
+          # actor type for exactly this shape.
+          persist-credentials: false
           fetch-depth: 0
+          ssh-key: ${{ secrets.SIGN_PUBLISH_DEPLOY_KEY }}
 
       - uses: actions/setup-python@v5
         with:
