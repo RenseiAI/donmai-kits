@@ -89,7 +89,11 @@ jobs:
           # commit cannot carry, and GitHub offers no bypass entry for the
           # Actions app itself — deploy keys are the sanctioned bypass
           # actor type for exactly this shape.
-          persist-credentials: false
+          # persist-credentials must stay true here: with `ssh-key`,
+          # persistence is what carries the deploy-key SSH config through to
+          # the final publish push step (false strips it after checkout —
+          # proven by run 31629834385 failing exactly there).
+          persist-credentials: true
           fetch-depth: 0
           ssh-key: ${{ secrets.SIGN_PUBLISH_DEPLOY_KEY }}
 
