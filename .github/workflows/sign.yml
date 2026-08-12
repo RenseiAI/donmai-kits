@@ -68,7 +68,10 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "push" && -n "${BEFORE_SHA:-}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
             python3 scripts/package_kits.py ci-check --base-ref "${BEFORE_SHA}"
           elif [[ -f .kit-package-v1-active ]]; then
-            python3 scripts/package_kits.py check
+            # Dispatch mode has no diff context; the signer's own pre-sign
+            # gate tolerates the narrowly-defined signing-pending state it
+            # exists to heal (old artifacts must still verify exactly).
+            python3 scripts/package_kits.py check --allow-signing-pending
           else
             python3 scripts/package_kits.py check --allow-legacy-only
           fi

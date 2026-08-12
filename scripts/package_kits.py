@@ -982,6 +982,7 @@ def check_catalog(
     root: Path,
     *,
     allow_legacy_only: bool = False,
+    allow_signing_pending: bool = False,
     expected_identities: Mapping[str, str] = EXPECTED_KIT_IDENTITIES,
 ) -> tuple[str, list[tuple[str, str]]]:
     kit_dirs = discover_kit_dirs(root, expected_identities=expected_identities)
@@ -1024,11 +1025,43 @@ def check_catalog(
     )
 
     generated = []
+    pending_kits: list[str] = []
     for kit_dir in published:
-        descriptor_bytes = validate_descriptor(root, kit_dir)
-        generated.append((kit_dir.name, hashlib.sha256(descriptor_bytes).hexdigest()))
         signature_path = kit_dir / DESCRIPTOR_SIGNATURE_NAME
-        validate_sigstore_bundle(root, signature_path, descriptor_bytes)
+        try:
+            descriptor_bytes = validate_descriptor(root, kit_dir)
+            validate_sigstore_bundle(root, signature_path, descriptor_bytes)
+        except PackageError:
+            if not allow_signing_pending:
+                raise
+            # Signing-pending, defined narrowly (the sign workflow's own
+            # pre-sign gate, dispatch mode — no diff context): the RECORDED
+            # package state must still verify exactly (old bytes, old
+            # signature — internally consistent), and the CURRENT manifest
+            # must produce a genuinely different candidate the signer is
+            # about to sign. Anything else re-raises as corruption. This is
+            # the same classification ci-check applies with a diff; cosign
+            # re-verification after signing still binds the fresh artifacts.
+            published_descriptor, _ = validate_descriptor_structure(root, kit_dir)
+            validate_sigstore_bundle(root, signature_path, published_descriptor)
+            _, candidate_descriptor = build_descriptor(
+                root,
+                kit_dir,
+                require_legacy_subject_match=False,
+            )
+            _require(
+                candidate_descriptor != published_descriptor,
+                f"{kit_dir.name}: artifacts fail strict validation but the "
+                "manifest is unchanged — not signing-pending",
+            )
+            pending_kits.append(kit_dir.name)
+            generated.append(
+                (kit_dir.name, hashlib.sha256(candidate_descriptor).hexdigest())
+            )
+            continue
+        generated.append((kit_dir.name, hashlib.sha256(descriptor_bytes).hexdigest()))
+    if pending_kits:
+        return "signing-pending", generated
     return "published", generated
 
 
@@ -1571,6 +1604,7 @@ def main(argv: list[str]) -> int:
 
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--allow-legacy-only", action="store_true")
+    check_parser.add_argument("--allow-signing-pending", action="store_true")
 
     subparsers.add_parser("generate")
     subparsers.add_parser("publication-check")
@@ -1599,6 +1633,7 @@ def main(argv: list[str]) -> int:
         state, generated = check_catalog(
             root,
             allow_legacy_only=args.allow_legacy_only,
+            allow_signing_pending=getattr(args, "allow_signing_pending", False),
         )
         _print_result(state, generated)
         return 0
