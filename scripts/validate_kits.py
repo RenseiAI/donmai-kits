@@ -453,6 +453,52 @@ def validate_kit(kit_toml: Path) -> list[str]:
                 if key in wac and not _is_str_list(wac[key]):
                     err(f"[provide.workarea_config].{key}: must be a list of strings")
 
+    # lanes — array of { name, os[], arch[] }. A [[provide.lanes]] entry
+    # declares a NAMED command lane gated to a subset of this kit's own
+    # [supports].os/.arch (e.g. the swift kit's macOS-only iOS-app-build
+    # lane). Mirrors the daemon's permissive decode shape
+    # (`Lanes []struct{ Name, OS, Arch }` in daemon/kit_registry.go); os/arch
+    # are optional (permissive-empty means "every OS/arch the kit itself
+    # supports," same convention as [supports] itself) but when present must
+    # narrow, never widen, the kit's own [supports] set.
+    kit_supported_os = supports.get("os", []) if isinstance(supports, dict) else []
+    kit_supported_arch = supports.get("arch", []) if isinstance(supports, dict) else []
+    for i, lane in enumerate(provide.get("lanes", []) or []):
+        if not isinstance(lane, dict):
+            err(f"[[provide.lanes]][{i}]: must be a table")
+            continue
+        name = lane.get("name")
+        if not isinstance(name, str) or not name.strip():
+            err(f"[[provide.lanes]][{i}].name: required non-empty string")
+        lane_os = lane.get("os")
+        if lane_os is not None:
+            if not _is_str_list(lane_os):
+                err(f"[[provide.lanes]][{i}].os: must be a list of strings")
+            else:
+                bad = set(lane_os) - VALID_OS
+                if bad:
+                    err(f"[[provide.lanes]][{i}].os: unknown OS values {sorted(bad)}; allowed {sorted(VALID_OS)}")
+                elif kit_supported_os and not set(lane_os) <= set(kit_supported_os):
+                    extra = sorted(set(lane_os) - set(kit_supported_os))
+                    err(
+                        f"[[provide.lanes]][{i}].os: {extra} not in this kit's own [supports].os "
+                        f"{sorted(kit_supported_os)} — a lane must narrow, never widen"
+                    )
+        lane_arch = lane.get("arch")
+        if lane_arch is not None:
+            if not _is_str_list(lane_arch):
+                err(f"[[provide.lanes]][{i}].arch: must be a list of strings")
+            else:
+                bad = set(lane_arch) - VALID_ARCH
+                if bad:
+                    err(f"[[provide.lanes]][{i}].arch: unknown arch values {sorted(bad)}; allowed {sorted(VALID_ARCH)}")
+                elif kit_supported_arch and not set(lane_arch) <= set(kit_supported_arch):
+                    extra = sorted(set(lane_arch) - set(kit_supported_arch))
+                    err(
+                        f"[[provide.lanes]][{i}].arch: {extra} not in this kit's own [supports].arch "
+                        f"{sorted(kit_supported_arch)} — a lane must narrow, never widen"
+                    )
+
     # --- [composition] ------------------------------------------------------
     comp = manifest.get("composition", {})
     if comp:
