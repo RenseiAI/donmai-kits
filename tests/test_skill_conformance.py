@@ -329,6 +329,140 @@ class SkillConformanceTests(unittest.TestCase):
 
         self.assertTrue(any("must exist inside the kit directory" in error for error in errors))
 
+    def test_lane_declares_a_macos_only_placement_demand(self) -> None:
+        # Regression pin for the swift kit's [[provide.lanes]] pilot: a lane
+        # narrower than the kit's own [supports].os must validate cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[supports]\n"
+                "os = [\"linux\", \"macos\"]\n"
+                "[[provide.lanes]]\n"
+                "name = \"ios-app-build\"\n"
+                "os = [\"macos\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertEqual([], errors)
+
+    def test_lane_missing_name_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[[provide.lanes]]\n"
+                "os = [\"macos\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertTrue(any("[[provide.lanes]][0].name: required" in error for error in errors))
+
+    def test_lane_unknown_os_value_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[[provide.lanes]]\n"
+                "name = \"bogus-lane\"\n"
+                "os = [\"beos\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertTrue(any("unknown OS values" in error for error in errors))
+
+    def test_lane_widening_beyond_kit_supports_fails(self) -> None:
+        # A lane must narrow the kit's own [supports].os, never widen it —
+        # declaring windows on a linux/macos-only kit is an authoring bug.
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[supports]\n"
+                "os = [\"linux\", \"macos\"]\n"
+                "[[provide.lanes]]\n"
+                "name = \"windows-only-lane\"\n"
+                "os = [\"windows\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertTrue(any("must narrow, never widen" in error for error in errors))
+
+    def test_lane_arch_widening_beyond_kit_supports_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[supports]\n"
+                "arch = [\"arm64\"]\n"
+                "[[provide.lanes]]\n"
+                "name = \"x86-only-lane\"\n"
+                "arch = [\"x86_64\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertTrue(any("must narrow, never widen" in error for error in errors))
+
+    def test_lane_entry_must_be_a_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit_dir = Path(tmp) / "kit"
+            kit_dir.mkdir()
+            manifest = kit_dir / "kit.toml"
+            manifest.write_text(
+                "api = \"rensei.dev/v1\"\n"
+                "[kit]\n"
+                "id = \"default/lane-demo\"\n"
+                "version = \"1.0.0\"\n"
+                "name = \"lane-demo\"\n"
+                "[provide]\n"
+                "lanes = [\"not-a-table\"]\n",
+                encoding="utf-8",
+            )
+
+            errors = validate_kit(manifest)
+
+        self.assertTrue(any("[[provide.lanes]][0]: must be a table" in error for error in errors))
+
     def test_malformed_kit_section_is_reported_without_catalog_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

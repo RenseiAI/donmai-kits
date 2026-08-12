@@ -24,6 +24,7 @@ A kit manifest (`kit.toml`, `api = "rensei.dev/v1"`) declares:
 | `[requires]` | host version range + capabilities |
 | `[detect]` | declarative `files` (any-exists), `files_all` (all-exist), `not_files`, `[detect.toolchain]` pin, optional `[[detect.content_matches]]` |
 | `[provide.commands]` | `build` / `test` / `validate` (+ `[provide.commands_override.<os>]`) |
+| `[[provide.lanes]]` | named command lane gated to a subset of this kit's own `[supports].os`/`.arch` — a placement demand narrower than the kit overall (e.g. an iOS app-build lane that only exists on macOS) |
 | `[provide.toolchain_install.<os>]` | per-OS base-toolchain install scripts (the kit↔sandbox seam) |
 | `[provide.hooks]` | `post_acquire` (fetch deps) / `pre_release` (teardown), with `[provide.hooks.os.<os>]` overrides |
 | `[provide.tool_permissions]` | shell verbs the kit allows (`cargo *`, `go *`, …) |
@@ -48,6 +49,7 @@ sandbox never knows the kit.
 | `default/java` | foundation | `pom.xml` / `build.gradle(.kts)` | temurin 17 | `./mvnw package` / `./mvnw test` / `./mvnw compile` |
 | `default/python` | foundation | `pyproject.toml` / `requirements.txt` / `setup.py` | python 3.12 + uv | `python -m build` / `pytest` / `ruff check && mypy` |
 | `default/ruby` | foundation | `Gemfile` / `.ruby-version` | ruby 3.3 (rbenv) | `rake build` / `rspec` / `rubocop` |
+| `default/swift` | foundation | `Package.swift` | swift 6.0 (swiftly) | `swift build` / `swift test` / `swift format lint --strict --recursive Sources` |
 
 The TypeScript support is split into two kits: a base **`default/typescript`**
 foundation kit (any TS/Node project) and a **`default/ts-nextjs`** framework kit
@@ -121,7 +123,7 @@ python3 -m unittest discover -s tests -v
 
 CI also runs the full unittest suite, adversarial package path/link/collision/
 extra/missing/mode/race cases, version-bump enforcement, and generated-file
-drift checks on every push and PR. Publication is frozen to the current seven
+drift checks on every push and PR. Publication is frozen to the current eight
 directory/kit-id pairs until the architecture expansion hold is explicitly
 lifted; additions, deletions, renames, and id substitutions fail before
 signing. During the one-time package activation, the package check uses the
@@ -151,7 +153,7 @@ issuer = https://token.actions.githubusercontent.com
 The package descriptor inventories every payload file — including the stable
 legacy manifest bundle — by normalized path, SHA-256, byte size, and portable
 mode. The descriptor excludes itself and its detached signature to avoid a
-cycle. The workflow signs in that exact order, stages all seven package
+cycle. The workflow signs in that exact order, stages all eight package
 publications plus the activation marker, and materializes that exact Git tree
 as an immutable archive. It recomputes every inventory and verifies both bundle
 classes from the archive, then commits only if the commit tree is byte-for-byte

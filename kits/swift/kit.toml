@@ -23,7 +23,7 @@ api = "rensei.dev/v1"
 
 [kit]
 id = "default/swift"
-version = "1.0.0"
+version = "1.1.0"
 name = "Swift"
 description = "OSS default foundation kit for Swift Package Manager projects. Detects Package.swift and provides a pinned Swift 6 toolchain (via swiftly), build/test/format commands, and Swift conventions. Scope: Swift logic modules build/test on Linux; iOS/macOS app build, UI test, and screenshot are macOS-pool only."
 author = "donmai"
@@ -112,6 +112,19 @@ swift_6 = "curl -fsSL https://download.swift.org/swiftly/darwin/swiftly.pkg -o /
 build    = "swift build"
 test     = "swift test"
 validate = "swift format lint --strict --recursive Sources"
+
+# Placement demand — machine-readable counterpart to the header prose above.
+# [supports].os stays ["linux", "macos"]: the SPM build/test/validate lane
+# (base [provide.commands] + the override block above) runs on both. This
+# lane narrows further — iOS app build, UI test, and screenshot capture exist
+# ONLY on the macOS capacity pool, never on the Linux cloud lane. Command
+# bodies for the lane are out of scope here (a project's own Makefile/CI
+# drives xcodegen/xcodebuild/simctl); this declares the lane's placement
+# demand so a scheduler can filter candidates before dispatch instead of only
+# discovering the incompatibility at run time.
+[[provide.lanes]]
+name = "ios-app-build"
+os   = ["macos"]
 
 [provide.hooks]
 post_acquire = "bin/setup.sh"
