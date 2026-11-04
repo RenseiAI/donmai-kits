@@ -46,7 +46,7 @@ env:
 jobs:
   validate:
     name: validate before signing
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -79,7 +79,7 @@ jobs:
   sign:
     name: keyless-sign complete kit packages
     needs: validate
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
