@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 import unicodedata
 from pathlib import Path
@@ -17,6 +18,7 @@ from scripts.package_kits import (
     DESCRIPTOR_NAME,
     DESCRIPTOR_SIGNATURE_NAME,
     EXPECTED_KIT_IDENTITIES,
+    DEPENDENCY_MANIFEST_API,
     EXPECTED_MANIFEST_API,
     EXPECTED_PACKAGE_SIGNER_POLICY,
     PACKAGE_SCHEMA,
@@ -467,11 +469,14 @@ class CatalogCandidateTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "kitPackageSchema": PACKAGE_SCHEMA,
-                    "kitManifestApi": EXPECTED_MANIFEST_API,
+                    "kitManifestApi": tomllib.loads(manifest)["api"],
                 },
                 row["compatibility"],
             )
-            self.assertIn(f'api = "{EXPECTED_MANIFEST_API}"', manifest)
+            self.assertIn(
+                tomllib.loads(manifest)["api"],
+                (EXPECTED_MANIFEST_API, DEPENDENCY_MANIFEST_API),
+            )
 
     def test_malformed_revision_sequence_and_locator_fail_closed(self) -> None:
         cases = (

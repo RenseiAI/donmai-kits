@@ -69,6 +69,12 @@ EXPECTED_PACKAGE_SIGNER_POLICY = {
     "issuer": "https://token.actions.githubusercontent.com",
 }
 EXPECTED_MANIFEST_API = "rensei.dev/v1"
+# The dependency-stores revision (amends `donmai.dev/v2` in place). A kit whose
+# manifest declares a dependency store publishes under it; every other kit
+# stays on the legacy v1 spelling, and the v1 line of a kit stays installable
+# for consumers that predate the revision.
+DEPENDENCY_MANIFEST_API = "donmai.dev/v2"
+SUPPORTED_MANIFEST_APIS = (EXPECTED_MANIFEST_API, DEPENDENCY_MANIFEST_API)
 EXPECTED_KIT_IDENTITIES = {
     "go": "default/go",
     "java": "default/java",
@@ -1168,8 +1174,8 @@ def build_catalog_snapshot_candidate(
         except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise PackageError(f"cannot parse {locator} manifest: {exc}") from exc
         _require(
-            manifest.get("api") == EXPECTED_MANIFEST_API,
-            f"{locator} manifest api is not {EXPECTED_MANIFEST_API!r}",
+            manifest.get("api") in SUPPORTED_MANIFEST_APIS,
+            f"{locator} manifest api is not one of {list(SUPPORTED_MANIFEST_APIS)!r}",
         )
         manifest_entry = _entry_map(descriptor["entries"], locator).get(
             descriptor["manifest"]
@@ -1187,7 +1193,7 @@ def build_catalog_snapshot_candidate(
                 "packageSignerPolicy": EXPECTED_PACKAGE_SIGNER_POLICY,
                 "compatibility": {
                     "kitPackageSchema": PACKAGE_SCHEMA,
-                    "kitManifestApi": EXPECTED_MANIFEST_API,
+                    "kitManifestApi": manifest["api"],
                 },
             }
         )

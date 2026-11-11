@@ -71,15 +71,20 @@ your last edit and quote each result line in your report.
   same repo is a hard error (`ErrKitFoundationConflict`) — foundations detect
   on disjoint files; frameworks compose on top.
 - Every catalog kit declares the required surface: `[provide.commands]`,
-  per-OS `[provide.toolchain_install]` (`.linux` minimum), a `post_acquire`
-  hook, `[provide.tool_permissions]`, ≥1 skill, ≥1 prompt fragment, and
-  `[provide.workarea_config]` (`clean_dirs` + `preserve_dirs`).
+  per-OS `[provide.toolchain_install]` (`.linux` minimum),
+  `[provide.tool_permissions]`, ≥1 skill, ≥1 prompt fragment, and
+  `[provide.workarea_config]` (`clean_dirs` + `preserve_dirs`). A
+  `post_acquire` hook is declared only where the kit has setup beyond a
+  dependency install (the TypeScript kits declare none).
 - Every referenced `SKILL.md` starts with Agent Skills YAML frontmatter. Its
   required `name` matches both the skill directory and manifest `id`, and its
   non-empty `description` explains what the skill does and when to use it.
-- `post_acquire` fetches framework dependencies only — never the base
-  toolchain (that is `toolchain_install`'s job; order is install →
-  post_acquire).
+- A hook never installs dependencies and never the base toolchain (that is
+  `toolchain_install`'s job; order is install → post_acquire). Dependencies come
+  from `[[provide.dependency_store]]` entries, which need
+  `api = "donmai.dev/v2"` and a `versions` range, a `no_code` block and a
+  `credentials` block per entry (CONTRIBUTING.md § "Dependency stores").
+  `validate_kits.py` refuses a non-frozen install in any hook.
 - Kit identity stays brand-neutral: `author = "donmai"`,
   `authorIdentity = "did:web:donmai.dev"`, `homepage = "https://donmai.dev"`.
 - Package publication is frozen to the directory/kit-id pairs encoded in
@@ -95,7 +100,9 @@ your last edit and quote each result line in your report.
   descriptor but no legacy signature is rejected (the demotion-hole guard). See
   `../donmai-architecture/ADR-2026-07-12-kit-catalog-expansion.md`.
 - `api = "rensei.dev/v1"` is the manifest protocol wire constant the daemon
-  parser keys on — preserved verbatim in every manifest; never rename it.
+  parser keys on — preserved verbatim in every manifest that declares no
+  dependency store; never rename it. A manifest that declares one uses
+  `api = "donmai.dev/v2"`.
 - After every manifest edit, re-run `python3 scripts/validate_kits.py` before
   claiming anything works (the manifest IS the product here).
 

@@ -34,6 +34,11 @@ from pathlib import Path, PureWindowsPath
 # protocol identifier, not a product name. Bump in lock-step with the daemon
 # parser if the manifest schema version ever moves.
 EXPECTED_API = "rensei.dev/v1"
+# The dependency-stores revision. It amends `donmai.dev/v2` in place and is the
+# only revision that may carry `[[provide.dependency_store]]`. Manifests with
+# no dependency store stay on the legacy v1 spelling.
+DEPENDENCY_API = "donmai.dev/v2"
+SUPPORTED_APIS = (EXPECTED_API, DEPENDENCY_API)
 
 VALID_OS = {"linux", "macos", "windows"}
 VALID_ARCH = {"x86_64", "arm64"}
@@ -249,8 +254,8 @@ def validate_kit(kit_toml: Path) -> list[str]:
 
     # --- api ----------------------------------------------------------------
     api = manifest.get("api")
-    if api != EXPECTED_API:
-        err(f'api: expected "{EXPECTED_API}", got {api!r}')
+    if api not in SUPPORTED_APIS:
+        err(f"api: expected one of {list(SUPPORTED_APIS)}, got {api!r}")
 
     # --- [kit] --------------------------------------------------------------
     kit = manifest.get("kit")
@@ -443,6 +448,11 @@ def validate_kit(kit_toml: Path) -> list[str]:
                         if isinstance(entry, dict):
                             _check_hook_files(entry, kit_dir, err, scope=f"os.{os_key}")
 
+    # dependency stores — the entries host dependency preparation installs from,
+    # plus the rule that no hook installs dependencies.
+    managers_with_entry = _check_dependency_stores(manifest, provide, api, err)
+    _check_hooks_install_nothing(provide.get("hooks", {}), kit_dir, managers_with_entry, err)
+
     # workarea_config — clean_dirs / preserve_dirs string lists
     wac = provide.get("workarea_config", {})
     if wac:
@@ -513,6 +523,348 @@ def validate_kit(kit_toml: Path) -> list[str]:
                     err(f"[composition].{key}: must be a list of strings")
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Dependency stores (005 § dependency_store; the dependency-preparation ADR)
+# ---------------------------------------------------------------------------
+
+STORE_SHARING = {"content-addressed", "session-only"}
+STORE_INTEGRITY = {"on-use", "on-fetch", "none"}
+STORE_COMMANDS = {"fetch", "install", "online", "reconcile", "verify", "relocate"}
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Settings the preparer never lets a manifest set: loader variables and node's
+# option channel load code the manager never asked for.
+FORBIDDEN_ENV_PREFIXES = ("DYLD_", "LD_")
+FORBIDDEN_ENV_NAMES = {"NODE_OPTIONS"}
+# Managers whose install commands in a store entry must run frozen, and the
+# flags that make each frozen.
+FROZEN_FLAGS = {
+    "pnpm": ("--frozen-lockfile",),
+    "yarn": ("--frozen-lockfile", "--immutable"),
+    "bun": ("--frozen-lockfile",),
+}
+_INF = (10**9, 0, 0)
+
+
+def _forbidden_env(name: str) -> bool:
+    return name in FORBIDDEN_ENV_NAMES or name.startswith(FORBIDDEN_ENV_PREFIXES)
+
+
+def _parse_partial(text: str) -> tuple[tuple[int, int, int], int] | None:
+    """Parse N, N.N or N.N.N (x, X and * are wildcards). Returns the version
+    padded with zeros and the count of numeric parts, or None."""
+    parts = text.split(".")
+    if not 1 <= len(parts) <= 3:
+        return None
+    nums: list[int] = []
+    for part in parts:
+        if part in ("x", "X", "*"):
+            break
+        if not re.fullmatch(r"0|[1-9][0-9]*", part):
+            return None
+        nums.append(int(part))
+    count = len(nums)
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2]), count
+
+
+def _bump(version: tuple[int, int, int], count: int) -> tuple[int, int, int]:
+    """The exclusive upper bound of a partial with `count` numeric parts."""
+    major, minor, patch = version
+    if count <= 0:
+        return _INF
+    if count == 1:
+        return (major + 1, 0, 0)
+    if count == 2:
+        return (major, minor + 1, 0)
+    return (major, minor, patch + 1)
+
+
+def parse_version_range(text: str) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+    """Parse the `versions` grammar into half-open [lo, hi) intervals over
+    release versions. Mirrors the daemon's grammar:
+
+        range      = set { "||" set }
+        set        = comparator { space comparator } | "*"
+        comparator = [ ">=" | ">" | "<=" | "<" | "=" | "^" | "~" ] partial
+
+    Bounds carry no prerelease or build part. Raises ValueError on a string the
+    grammar rejects or a set that matches no version."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("must be a non-empty semver range")
+    intervals = []
+    for set_text in text.split("||"):
+        lo, hi = (0, 0, 0), _INF
+        tokens = set_text.split()
+        if not tokens:
+            raise ValueError("empty range set")
+        for token in tokens:
+            if token == "*":
+                continue
+            m = re.fullmatch(r"(>=|<=|>|<|=|\^|~)?(.+)", token)
+            op, body = (m.group(1) or "="), m.group(2)
+            parsed = _parse_partial(body)
+            if parsed is None:
+                raise ValueError(f"comparator {token!r} is not understood")
+            version, count = parsed
+            if op == ">=":
+                c_lo, c_hi = version, _INF
+            elif op == ">":
+                c_lo, c_hi = _bump(version, count), _INF
+            elif op == "<":
+                c_lo, c_hi = (0, 0, 0), version
+            elif op == "<=":
+                c_lo, c_hi = (0, 0, 0), _bump(version, count)
+            elif op == "=":
+                c_lo, c_hi = version, _bump(version, count)
+            elif op == "~":
+                c_lo = version
+                c_hi = _bump(version, 2 if count >= 2 else count)
+            else:  # caret
+                c_lo = version
+                if version[0] > 0 or count <= 1:
+                    c_hi = (version[0] + 1, 0, 0)
+                elif version[1] > 0 or count == 2:
+                    c_hi = (0, version[1] + 1, 0)
+                else:
+                    c_hi = (0, 0, version[2] + 1)
+            lo, hi = max(lo, c_lo), min(hi, c_hi)
+        if lo >= hi:
+            raise ValueError(f"set {set_text.strip()!r} matches no version")
+        intervals.append((lo, hi))
+    return intervals
+
+
+def _ranges_overlap(a: str, b: str) -> bool:
+    return any(
+        max(alo, blo) < min(ahi, bhi)
+        for alo, ahi in parse_version_range(a)
+        for blo, bhi in parse_version_range(b)
+    )
+
+
+def _check_dependency_stores(manifest: dict, provide: dict, api: object, err) -> set[str]:
+    """Validate [[provide.dependency_store]]. Returns the managers the kit
+    declares an entry for."""
+    stores = provide.get("dependency_store")
+    if stores is None:
+        return set()
+    if not isinstance(stores, list) or not stores:
+        err("[[provide.dependency_store]]: must be an array of tables")
+        return set()
+    if api != DEPENDENCY_API:
+        err(f'[[provide.dependency_store]]: requires api "{DEPENDENCY_API}", manifest declares {api!r}')
+
+    managers: dict[str, list[tuple[int, str | None]]] = {}
+    for i, entry in enumerate(stores):
+        where = f"[[provide.dependency_store]][{i}]"
+        if not isinstance(entry, dict):
+            err(f"{where}: must be a table")
+            continue
+        manager = entry.get("manager")
+        if not isinstance(manager, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", manager):
+            err(f"{where}.manager: required identifier")
+            continue
+        where = f"{where} ({manager})"
+        versions = entry.get("versions")
+        if versions is not None:
+            try:
+                parse_version_range(versions)
+            except ValueError as exc:
+                err(f"{where}.versions: {exc}")
+                versions = None
+        managers.setdefault(manager, []).append((i, versions))
+
+        if not isinstance(entry.get("ecosystem"), str) or not entry["ecosystem"]:
+            err(f"{where}.ecosystem: required non-empty string")
+        lockfiles = entry.get("lockfiles")
+        if not _is_str_list(lockfiles) or not lockfiles:
+            err(f"{where}.lockfiles: required non-empty list of strings")
+        if not isinstance(entry.get("version"), str) or not entry["version"]:
+            err(f"{where}.version: required command that prints the manager version")
+        if "inputs" in entry and not _is_str_list(entry["inputs"]):
+            err(f"{where}.inputs: must be a list of strings")
+
+        store = entry.get("store")
+        if not isinstance(store, dict):
+            err(f"{where}.store: required table")
+            store = {}
+        if store.get("sharing") not in STORE_SHARING:
+            err(f"{where}.store.sharing: must be one of {sorted(STORE_SHARING)}")
+        if store.get("integrity") not in STORE_INTEGRITY:
+            err(f"{where}.store.integrity: must be one of {sorted(STORE_INTEGRITY)}")
+        elif store.get("integrity") == "none" and store.get("sharing") != "session-only":
+            err(f"{where}.store: integrity none requires session-only sharing")
+        for key in ("env", "content", "bookkeeping", "secrets", "never_share"):
+            if key in store and not _is_str_list(store[key]):
+                err(f"{where}.store.{key}: must be a list of strings")
+        for name in store.get("env", []) if _is_str_list(store.get("env", [])) else []:
+            if not ENV_NAME_RE.match(name):
+                err(f"{where}.store.env: {name!r} is not an environment variable name")
+        for key in ("content", "bookkeeping", "secrets", "never_share"):
+            for path in store.get(key, []) if _is_str_list(store.get(key, [])) else []:
+                if path.startswith(("/", "~")) or ".." in path.replace("\\", "/").split("/"):
+                    err(f"{where}.store.{key}: {path!r} must be a relative path inside the store")
+        shared = store.get("content", []) if _is_str_list(store.get("content", [])) else []
+        for key in ("secrets", "never_share"):
+            for path in store.get(key, []) if _is_str_list(store.get(key, [])) else []:
+                for content in shared:
+                    if path == content or path.startswith(content.rstrip("/") + "/") or content.startswith(path.rstrip("/") + "/"):
+                        err(f"{where}.store.{key}: {path!r} overlaps shared content {content!r}")
+        if store.get("sharing") == "content-addressed" and not shared:
+            err(f"{where}.store.content: a content-addressed store must name its content paths")
+
+        imp = entry.get("import", {})
+        if imp and not (isinstance(imp, dict) and _is_str_map(imp.get("env", {}))):
+            err(f"{where}.import.env: must be a map of string->string")
+
+        # no_code: required on every catalog entry. An entry without it cannot
+        # be used unconfined (the host refuses it), so an official entry must
+        # declare it, even when the manager runs no package code (an empty
+        # table).
+        no_code = entry.get("no_code")
+        if not isinstance(no_code, dict):
+            err(f"{where}.no_code: required table (declare an empty table when the manager runs no package code)")
+        else:
+            env = no_code.get("env", {})
+            if not _is_str_map(env):
+                err(f"{where}.no_code.env: must be a map of string->string")
+            else:
+                for name in env:
+                    if not ENV_NAME_RE.match(name) or _forbidden_env(name):
+                        err(f"{where}.no_code.env: {name!r} is not an allowed environment variable")
+            if manager == "pnpm" and not (
+                isinstance(env, dict)
+                and env.get("npm_config_ignore_scripts") == "true"
+                and env.get("npm_config_ignore_pnpmfile") == "true"
+            ):
+                err(f"{where}.no_code.env: pnpm must set npm_config_ignore_scripts and npm_config_ignore_pnpmfile to \"true\"")
+
+        creds = entry.get("credentials")
+        if creds is not None:
+            name = creds.get("config_env") if isinstance(creds, dict) else None
+            if not isinstance(name, str) or not ENV_NAME_RE.match(name) or _forbidden_env(name):
+                err(f"{where}.credentials.config_env: must name an allowed environment variable")
+            else:
+                taken = set(store.get("env", []) if _is_str_list(store.get("env", [])) else [])
+                taken |= set(imp.get("env", {})) if isinstance(imp, dict) and isinstance(imp.get("env"), dict) else set()
+                taken |= set(no_code.get("env", {})) if isinstance(no_code, dict) and isinstance(no_code.get("env"), dict) else set()
+                if name in taken:
+                    err(f"{where}.credentials.config_env: {name!r} is also set by another variable of the entry")
+
+        commands = entry.get("commands")
+        if not _is_str_map(commands):
+            err(f"{where}.commands: required map of string->string")
+            continue
+        unknown = set(commands) - STORE_COMMANDS
+        if unknown:
+            err(f"{where}.commands: unknown commands {sorted(unknown)}; allowed {sorted(STORE_COMMANDS)}")
+        for required in ("fetch", "install"):
+            if not commands.get(required):
+                err(f"{where}.commands.{required}: required")
+        if store.get("integrity") == "on-fetch" and not commands.get("verify"):
+            err(f"{where}.commands.verify: required for on-fetch integrity")
+        for name, command in commands.items():
+            if name == "relocate":
+                continue
+            _check_store_command(where, manager, name, command, err)
+
+    for manager, declared in managers.items():
+        if len(declared) < 2:
+            continue
+        for a in range(len(declared)):
+            for b in range(a + 1, len(declared)):
+                (ia, ra), (ib, rb) = declared[a], declared[b]
+                if ra is None or rb is None or _ranges_overlap(ra, rb):
+                    err(
+                        f"[[provide.dependency_store]]: {manager} entries {ia} and {ib} "
+                        "have overlapping or missing `versions` ranges"
+                    )
+    return set(managers)
+
+
+def _check_store_command(where: str, manager: str, name: str, command: str, err) -> None:
+    """Install-shaped store commands must run frozen; the offline install must
+    also be offline."""
+    for segment in re.split(r"&&|\|\||;|\n", command):
+        argv = segment.split()
+        if len(argv) >= 2 and argv[0] == manager and argv[1] in ("install", "i", "add"):
+            frozen = FROZEN_FLAGS.get(manager)
+            if frozen and not any(flag in argv for flag in frozen):
+                err(f"{where}.commands.{name}: {segment.strip()!r} is not a frozen-lockfile install")
+            if name == "install" and "--offline" not in argv:
+                err(f"{where}.commands.install: {segment.strip()!r} must run offline")
+
+
+# An install of a package manager's dependencies. `npm ci` is frozen by nature;
+# every other form is frozen only with an explicit flag.
+HOOK_INSTALL_RE = re.compile(
+    r"(?:^|[\s;&|(])(?P<mgr>pnpm|pnpm\.cmd|npm|npm\.cmd|yarn|yarn\.cmd|bun)"
+    r"(?:\s+(?P<verb>install|i|ci|add))?(?P<rest>[^\n;&|)]*)"
+)
+HOOK_FROZEN = ("--frozen-lockfile", "--immutable")
+
+
+def _hook_install_findings(text: str) -> list[tuple[str, bool]]:
+    """Return (manager, frozen) for each dependency install in a hook body."""
+    findings = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "REM ", "rem ", "::", "echo ", "@echo")):
+            continue
+        for m in HOOK_INSTALL_RE.finditer(line):
+            before = line[: m.start("mgr")].rstrip()
+            if before.endswith(("-v", "which", "type", "where")):
+                continue  # a presence probe such as `command -v yarn`
+            mgr = m.group("mgr").split(".")[0]
+            verb = m.group("verb")
+            rest = m.group("rest") or ""
+            is_bare_yarn = mgr == "yarn" and verb is None and not rest.strip()
+            if verb in ("install", "i", "add", "ci") or is_bare_yarn:
+                frozen = verb == "ci" or any(f in rest for f in HOOK_FROZEN)
+                findings.append((mgr, frozen))
+    return findings
+
+
+def _check_hooks_install_nothing(hooks: object, kit_dir: Path, managers_with_entry: set[str], err) -> None:
+    """Dependency preparation never runs a hook, and a hook must not install
+    dependencies: a non-frozen install may re-resolve the lockfile and runs
+    lifecycle scripts unconfined, and an install of a manager the kit declares
+    an entry for duplicates what the host does."""
+    if not isinstance(hooks, dict):
+        return
+
+    def scopes(table: dict, scope: str):
+        for hook_key in ("post_acquire", "pre_release"):
+            val = table.get(hook_key)
+            if isinstance(val, str):
+                yield f"[provide.hooks{scope}].{hook_key}", val
+
+    candidates = list(scopes(hooks, ""))
+    os_hooks = hooks.get("os", {})
+    if isinstance(os_hooks, dict):
+        for os_key, entry in os_hooks.items():
+            if isinstance(entry, dict):
+                candidates.extend(scopes(entry, f".os.{os_key}"))
+    for label, val in candidates:
+        bodies = [val]
+        looks_like_path = "/" in val or "\\" in val or val.endswith((".sh", ".cmd"))
+        if looks_like_path:
+            script = _contained_file(kit_dir, val)
+            if script is not None:
+                try:
+                    bodies.append(script.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+        for body in bodies:
+            for mgr, frozen in _hook_install_findings(body):
+                if not frozen:
+                    err(f"{label}: runs a non-frozen {mgr} install; dependency installs belong to a dependency_store entry, and a hook must never re-resolve a lockfile")
+                elif mgr in managers_with_entry:
+                    err(f"{label}: installs {mgr} dependencies, but this kit declares a {mgr} dependency_store entry")
+
 
 
 def _check_hook_files(hooks: dict, kit_dir: Path, err, scope: str = "") -> None:

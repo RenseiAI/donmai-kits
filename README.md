@@ -15,7 +15,7 @@ per-tenant policy, and publication UI are a separate, closed concern.
 
 ## What a kit is
 
-A kit manifest (`kit.toml`, `api = "rensei.dev/v1"`) declares:
+A kit manifest (`kit.toml`, `api = "rensei.dev/v1"`, or `donmai.dev/v2` when it declares a dependency store) declares:
 
 | Section | Purpose |
 |---|---|
@@ -26,7 +26,8 @@ A kit manifest (`kit.toml`, `api = "rensei.dev/v1"`) declares:
 | `[provide.commands]` | `build` / `test` / `validate` (+ `[provide.commands_override.<os>]`) |
 | `[[provide.lanes]]` | named command lane gated to a subset of this kit's own `[supports].os`/`.arch` — a placement demand narrower than the kit overall (e.g. an iOS app-build lane that only exists on macOS) |
 | `[provide.toolchain_install.<os>]` | per-OS base-toolchain install scripts (the kit↔sandbox seam) |
-| `[provide.hooks]` | `post_acquire` (fetch deps) / `pre_release` (teardown), with `[provide.hooks.os.<os>]` overrides |
+| `[[provide.dependency_store]]` | per-manager, per-store-layout dependency entries (`versions`, `fetch` / offline frozen `install`, `no_code`, `credentials`); needs `api = "donmai.dev/v2"` |
+| `[provide.hooks]` | `post_acquire` (setup; never a dependency install) / `pre_release` (teardown), with `[provide.hooks.os.<os>]` overrides |
 | `[provide.tool_permissions]` | shell verbs the kit allows (`cargo *`, `go *`, …) |
 | `[provide.prompt_fragments]` / `[provide.skills]` | conventions partials + SKILL.md references |
 | `[provide.workarea_config]` | `clean_dirs` / `preserve_dirs` |
@@ -55,6 +56,8 @@ The TypeScript support is split into two kits: a base **`default/typescript`**
 foundation kit (any TS/Node project) and a **`default/ts-nextjs`** framework kit
 that composes on top for Next.js projects. A Next.js repo selects both — one
 foundation + one framework — and they compose `foundation → framework`.
+The foundation kit declares the pnpm 9 and pnpm 10 dependency stores; neither
+kit installs dependencies in a hook.
 
 ### Layout
 
@@ -65,7 +68,7 @@ kits/
     kit.toml.sigstore              # legacy manifest-only compatibility bundle
     kit.package.json               # canonical signed full-file inventory
     kit.package.json.sigstore      # detached package-descriptor bundle
-    bin/setup.sh, bin/setup.cmd    # post_acquire hook scripts (posix + windows)
+    bin/setup.sh, bin/setup.cmd    # post_acquire hook scripts (posix + windows), where a kit has setup
     partials/<name>.yaml           # prompt fragments
     skills/<id>/SKILL.md           # skill definitions
 scripts/

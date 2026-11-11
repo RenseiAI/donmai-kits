@@ -1,4 +1,4 @@
-api = "rensei.dev/v1"
+api = "donmai.dev/v2"
 
 # ---------------------------------------------------------------------------
 # Kit identity — base TypeScript foundation kit.
@@ -12,7 +12,7 @@ api = "rensei.dev/v1"
 
 [kit]
 id = "default/typescript"
-version = "1.0.0"
+version = "2.0.0"
 name = "TypeScript"
 description = "OSS default foundation kit for TypeScript / Node projects. Detects tsconfig.json + package.json and provides Node 22, build/test/typecheck commands, and TS conventions."
 author = "donmai"
@@ -98,11 +98,97 @@ node_22 = "brew install node@22 && brew link --overwrite node@22"
 [provide.toolchain_install.windows]
 node_22 = "winget install OpenJS.NodeJS.LTS"
 
-[provide.hooks]
-post_acquire = "bin/setup.sh"
+# ---------------------------------------------------------------------------
+# Dependency stores — pnpm, one entry per store layout. The host's dependency
+# preparation installs from these entries (fetch, then an offline frozen
+# install, with no package code); this kit runs no install in a hook. Which
+# entry applies is chosen by the version in the repository's `packageManager`
+# pin: pnpm 9 keeps its store under `v3`, pnpm 10 under `v10`, so the two
+# never mix. A repository pinning another major gets no entry. npm and yarn
+# have no entry yet.
+# ---------------------------------------------------------------------------
 
-[provide.hooks.os.windows]
-post_acquire = "bin\\setup.cmd"
+# pnpm 9 (store layout v3). Its index records live inside v3/files.
+[[provide.dependency_store]]
+manager   = "pnpm"
+ecosystem = "node"
+lockfiles = ["pnpm-lock.yaml"]
+inputs    = ["pnpm-workspace.yaml", "**/package.json", ".npmrc", ".pnpmfile.cjs", "patches/**"]
+version   = "pnpm --version"
+versions  = ">=9 <10"
+
+[provide.dependency_store.store]
+env          = ["NPM_CONFIG_STORE_DIR"]
+default      = { macos = "~/Library/pnpm/store", linux = "~/.local/share/pnpm/store" }
+sharing      = "content-addressed"
+integrity    = "on-use"
+content      = ["v3/files"]
+bookkeeping  = ["v3/projects"]
+records_path = true
+
+[provide.dependency_store.import]
+env = { NPM_CONFIG_PACKAGE_IMPORT_METHOD = "clone-or-copy" }
+
+# Every phase runs with package code and the repository's own pnpmfile off.
+[provide.dependency_store.no_code]
+env = { npm_config_ignore_scripts = "true", npm_config_ignore_pnpmfile = "true" }
+
+# The per-run registry credential file is named by this variable, in the fetch
+# phase only.
+[provide.dependency_store.credentials]
+config_env = "NPM_CONFIG_USERCONFIG"
+
+[provide.dependency_store.commands]
+fetch   = "pnpm fetch"
+install = "pnpm install --offline --frozen-lockfile"
+online  = "pnpm install --prefer-offline --frozen-lockfile"
+
+[provide.dependency_store.snapshot]
+installed         = ["node_modules", "**/node_modules"]
+abi               = ["os", "arch", "libc", "node-abi"]
+relocation        = "reconcile"
+runs_package_code = true
+
+# pnpm 10 (store layout v10).
+[[provide.dependency_store]]
+manager   = "pnpm"
+ecosystem = "node"
+lockfiles = ["pnpm-lock.yaml"]
+inputs    = ["pnpm-workspace.yaml", "**/package.json", ".npmrc", ".pnpmfile.cjs", "patches/**"]
+version   = "pnpm --version"
+versions  = ">=10 <11"
+
+[provide.dependency_store.store]
+env          = ["NPM_CONFIG_STORE_DIR"]
+default      = { macos = "~/Library/pnpm/store", linux = "~/.local/share/pnpm/store" }
+sharing      = "content-addressed"
+integrity    = "on-use"
+content      = ["v10/files", "v10/index"]
+bookkeeping  = ["v10/projects"]
+records_path = true
+
+[provide.dependency_store.import]
+env = { NPM_CONFIG_PACKAGE_IMPORT_METHOD = "clone-or-copy" }
+
+# Every phase runs with package code and the repository's own pnpmfile off.
+[provide.dependency_store.no_code]
+env = { npm_config_ignore_scripts = "true", npm_config_ignore_pnpmfile = "true" }
+
+# The per-run registry credential file is named by this variable, in the fetch
+# phase only.
+[provide.dependency_store.credentials]
+config_env = "NPM_CONFIG_USERCONFIG"
+
+[provide.dependency_store.commands]
+fetch   = "pnpm fetch"
+install = "pnpm install --offline --frozen-lockfile"
+online  = "pnpm install --prefer-offline --frozen-lockfile"
+
+[provide.dependency_store.snapshot]
+installed         = ["node_modules", "**/node_modules"]
+abi               = ["os", "arch", "libc", "node-abi"]
+relocation        = "reconcile"
+runs_package_code = true
 
 # ---------------------------------------------------------------------------
 # Composition — foundation: base language layer, frameworks compose on top.

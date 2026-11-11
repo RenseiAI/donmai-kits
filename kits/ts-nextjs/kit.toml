@@ -1,4 +1,4 @@
-api = "rensei.dev/v1"
+api = "donmai.dev/v2"
 
 # ---------------------------------------------------------------------------
 # Kit identity — Next.js framework kit.
@@ -11,7 +11,7 @@ api = "rensei.dev/v1"
 
 [kit]
 id = "default/ts-nextjs"
-version = "1.0.0"
+version = "2.0.0"
 name = "TypeScript / Next.js"
 description = "OSS default kit for TypeScript and Next.js projects. Detects next.config.{ts,js,mjs} and package.json#dependencies.next."
 author = "donmai"
@@ -105,11 +105,10 @@ pnpm    = "npm install -g pnpm@latest"
 node_22 = "winget install OpenJS.NodeJS.LTS"
 pnpm    = "npm install -g pnpm@latest"
 
-[provide.hooks]
-post_acquire = "bin/setup.sh"
-
-[provide.hooks.os.windows]
-post_acquire = "bin\\setup.cmd"
+# Dependencies are installed by the host's dependency preparation from the
+# pnpm entries of the `default/typescript` foundation kit. This kit declares no
+# dependency store (declaring pnpm twice would conflict) and runs no install in
+# a hook.
 
 # ---------------------------------------------------------------------------
 # Composition — framework: composes on top of the base TypeScript kit.
