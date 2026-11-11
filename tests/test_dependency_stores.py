@@ -134,7 +134,8 @@ class HookInstallTests(unittest.TestCase):
         self.assertTrue(any("declares a pnpm dependency_store" in e for e in errors), errors)
 
     def test_comments_and_non_install_commands_pass(self) -> None:
-        self.assertEqual([], self.hook_errors("#!/bin/sh\n# pnpm install\ncommand -v pnpm\npnpm run build\n"))
+        script = "#!/bin/sh\n# pnpm install\ncommand -v pnpm\ncommand -v yarn &>/dev/null\nwhere yarn\npnpm run build\n"
+        self.assertEqual([], self.hook_errors(script))
 
 
 class VersionRangeTests(unittest.TestCase):

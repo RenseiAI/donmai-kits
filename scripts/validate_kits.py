@@ -815,6 +815,9 @@ def _hook_install_findings(text: str) -> list[tuple[str, bool]]:
         if not stripped or stripped.startswith(("#", "REM ", "rem ", "::", "echo ", "@echo")):
             continue
         for m in HOOK_INSTALL_RE.finditer(line):
+            before = line[: m.start("mgr")].rstrip()
+            if before.endswith(("-v", "which", "type", "where")):
+                continue  # a presence probe such as `command -v yarn`
             mgr = m.group("mgr").split(".")[0]
             verb = m.group("verb")
             rest = m.group("rest") or ""
