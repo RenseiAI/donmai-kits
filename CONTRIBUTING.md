@@ -19,9 +19,13 @@ lifted and the allowlisted set is reviewed in the same change.
    (e.g. `go = "1.23"`) so the workarea can pre-warm it.
 3. Declare `[provide.commands]` (`build` / `test` / `validate`) and per-OS
    `[provide.toolchain_install.<os>]` install scripts.
-4. Add a `post_acquire` hook (`bin/setup.sh` + `bin/setup.cmd`) that fetches
-   **framework dependencies only** — never the base toolchain (that is the
+4. Add a `post_acquire` hook (`bin/setup.sh` + `bin/setup.cmd`) only for setup
+   that is not a dependency install, and never the base toolchain (that is the
    install-scripts' job; the two streams run in order: install → post_acquire).
+   Dependencies are installed by the host from the kit's
+   `[[provide.dependency_store]]` entries, which require
+   `api = "donmai.dev/v2"` (see "Dependency stores" below). A hook never runs a
+   non-frozen install; `validate_kits.py` refuses one.
 5. Add at least one `SKILL.md` under `skills/<id>/` and a conventions partial
    under `partials/` so the skill-load and prompt-fragment paths are exercised.
    `SKILL.md` must start with Agent Skills YAML frontmatter containing `name`
@@ -47,7 +51,8 @@ publisher refuses a host that cannot provide race-safe no-follow reads.
 
 Every catalog kit should declare: `[provide.commands]`, per-OS
 `[provide.toolchain_install]` (at minimum `.linux` — cloud sandboxes are Linux),
-a `post_acquire` hook, `[provide.tool_permissions]` for the language's shell
+a `post_acquire` hook where it has setup beyond dependency installs (the
+TypeScript kits have none), `[provide.tool_permissions]` for the language's shell
 verbs, ≥1 `[provide.skills]`, ≥1 `[provide.prompt_fragments]`, and
 `[provide.workarea_config]` (`clean_dirs` + cache `preserve_dirs`).
 
@@ -99,6 +104,33 @@ identity brand-neutral: use `author = "donmai"`, `did:web:donmai.dev`,
 > Note: `api = "rensei.dev/v1"` is the manifest **protocol version constant** the
 > daemon parser keys on — it is a wire identifier, not a product name, and is
 > intentionally preserved verbatim across every manifest. Do not rename it.
+
+## Dependency stores
+
+A kit that installs a package manager's dependencies declares one
+`[[provide.dependency_store]]` entry per manager and store layout instead of
+running an install in a hook. The manifest then declares `api = "donmai.dev/v2"`,
+the only revision that may carry the section; daemons that predate the
+revision reject such a manifest. Every entry declares:
+
+- `versions`: a semver range of manager versions it covers. A kit may declare
+  one manager more than once only with non-overlapping ranges.
+- `[provide.dependency_store.no_code] env`: the settings that make every phase
+  run no package code.
+- `[provide.dependency_store.credentials] config_env`: the variable naming the
+  per-run credential file, set in the fetch phase only.
+- `fetch`, then an offline, frozen `install` (and a frozen `online` fallback).
+
+`default/typescript` declares pnpm `>=9 <10` (store layout `v3`) and pnpm
+`>=10 <11` (store layout `v10`). `default/ts-nextjs` declares none, because it
+composes on the foundation kit and declaring pnpm twice would conflict. npm and
+yarn have no entry yet, so a repository using them is not installed by the
+kit.
+
+**The v1 line.** A kit moving to `donmai.dev/v2` is a new major version of the
+same kit id. The previous `1.x` package, with its signatures, stays in this
+repository's history at the commit that published it, so an operator running a
+daemon that predates the revision installs that commit's package instead.
 
 ## Signing model
 
